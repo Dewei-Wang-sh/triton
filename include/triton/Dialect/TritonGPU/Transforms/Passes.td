@@ -49,6 +49,27 @@ def TritonGPUPrefetch : Pass<"tritongpu-prefetch", "mlir::ModuleOp"> {
                            "mlir::arith::ArithDialect"];
 }
 
+
+def TritonGPUMatchTargetSize : Pass<"tritongpu-match-target-size", "mlir::ModuleOp"> {
+  let summary = "match the target size of specific op (dot, load, store)";
+
+  let description = [{
+    this pass should be run after tritongpu-distribute-to-warps
+  }];
+
+  let constructor = "mlir::createTritonGPUMatchTargetSizePass()";
+
+  let dependentDialects = ["mlir::triton::TritonDialect",
+                           "mlir::triton::gpu::TritonGPUDialect"];
+
+  let options = [
+    ListOption<"dotSize", "dot-size",
+           "int64_t", "target LLVM/SPIRV IR dot operation size">
+    // fixme : add operate-size load-size, store-size
+    // load-operate-store-size 256DW which is 16x16xf32, 32x16xf16
+  ];
+}
+
 def TritonGPUAccelerateMatmul : Pass<"tritongpu-accelerate-matmul", "mlir::ModuleOp"> {
   let summary = "accelerate matmul";
 
