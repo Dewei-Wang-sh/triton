@@ -6,6 +6,7 @@ from typing import Any, Dict, Tuple
 from types import ModuleType
 import hashlib
 import tempfile
+import os
 import re
 import functools
 import warnings
@@ -401,6 +402,12 @@ class HIPBackend(BaseBackend):
                 llvm.link_extern_libs(llvm_mod, paths)
 
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', [], options.enable_fp_fusion)
+        print("before llvm module")
+        #print(llvm_mod)
+        if os.environ.get("FROM_LLVM", ""):
+            llvm_mod = llvm.parse_ir_file("/home/dewwang/.triton/test.ll", context);
+            print("using custom ll")
+        print("after llvm module")
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during
