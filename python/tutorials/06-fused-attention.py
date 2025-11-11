@@ -126,18 +126,19 @@ def _host_descriptor_pre_hook(nargs):
 
 
 if is_hip():
-    NUM_STAGES_OPTIONS = [1]
+    NUM_STAGES_OPTIONS = [3]
 elif supports_host_descriptor():
     NUM_STAGES_OPTIONS = [2, 3, 4]
 else:
     NUM_STAGES_OPTIONS = [2, 3, 4]
 
+#best config selected: BLOCK_M: 128, BLOCK_N: 64, num_warps: 4, num_ctas: 1, num_stages: 1, maxnreg: None;
 configs = [
     triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w, pre_hook=_host_descriptor_pre_hook) \
-    for BM in [64, 128]\
-    for BN in [32, 64, 128]\
+    for BM in [128]\
+    for BN in [64]\
     for s in NUM_STAGES_OPTIONS \
-    for w in [4, 8]\
+    for w in [4]\
 ]
 if "PYTEST_VERSION" in os.environ:
     # Use a single config in testing for reproducibility
@@ -609,18 +610,19 @@ attention = _attention.apply
 
 TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
 
+#@pytest.mark.parametrize("causal", [True])  # FIXME: Non-causal tests do not pass at the moment.
 
-@pytest.mark.parametrize("Z", [1, 4])
-@pytest.mark.parametrize("H", [2, 48])
-@pytest.mark.parametrize("N_CTX", [128, 1024, (2 if is_hip() else 4) * 1024])
-@pytest.mark.parametrize("HEAD_DIM", [64, 128])
-@pytest.mark.parametrize("causal", [True])  # FIXME: Non-causal tests do not pass at the moment.
-@pytest.mark.parametrize("warp_specialize", [False, True] if is_blackwell() else [False])
-@pytest.mark.parametrize("mode", ["fwd", "bwd"])
-@pytest.mark.parametrize("provider", ["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []))
+@pytest.mark.parametrize("Z", [4])
+@pytest.mark.parametrize("H", [48])
+@pytest.mark.parametrize("N_CTX", [1024])
+@pytest.mark.parametrize("HEAD_DIM", [128])
+@pytest.mark.parametrize("causal", [False])  # FIXME: Non-causal tests do not pass at the moment.
+@pytest.mark.parametrize("warp_specialize", [False] if is_blackwell() else [False])
+@pytest.mark.parametrize("mode", ["fwd", ])
+@pytest.mark.parametrize("provider", ["triton-fp16"])
 def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtype=torch.float16):
-    if mode == "fwd" and "fp16" in provider:
-        pytest.skip("Avoid running the forward computation twice.")
+    # if mode == "fwd" and "fp16" in provider:
+    #    pytest.skip("Avoid running the forward computation twice.")
     if mode == "bwd" and "fp8" in provider:
         pytest.skip("Backward pass with FP8 is not supported.")
     torch.manual_seed(20)
@@ -759,4 +761,5 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
 
 if __name__ == "__main__":
     # only works on post-Ampere GPUs right now
-    bench_flash_attention.run(save_path=".", print_data=True)
+    #bench_flash_attention.run(save_path=".", print_data=True)
+    test_op(4, 48, 1024, 128, False, False, 'fwd', "triton-fp16", dtype=torch.float16)

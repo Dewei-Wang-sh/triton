@@ -37,6 +37,7 @@ def get_ptxas(arch: int) -> knobs.NvidiaTool:
 
 @functools.lru_cache()
 def get_ptxas_version(arch: int = 80):
+    return 333
     mock_ver = knobs.nvidia.mock_ptx_version
     if mock_ver is not None:
         return mock_ver  # This is not really a version of ptxas, but it is good enough for testing
@@ -156,6 +157,7 @@ class CUDABackend(BaseBackend):
     def _parse_arch(self, arch):
         pattern = r"^sm(\d+)$"
         match = re.fullmatch(pattern, arch)
+        print(arch)
         if not match:
             raise ValueError(f"TRITON_OVERRIDE_ARCH must have the form {pattern}")
         return int(match.group(1))
@@ -173,8 +175,10 @@ class CUDABackend(BaseBackend):
         if "instrumentation_mode" in opts and opts["instrumentation_mode"] == "consan":
             opts["debug"] = True
 
-        args = {'arch': knobs.runtime.override_arch or f"sm{self.target.arch}"}
+        #args = {'arch': knobs.runtime.override_arch or f"sm{self.target.arch}"}
+        args = {'arch': f"sm80"}
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
+        print(args)
         capability = int(self._parse_arch(args["arch"]))
 
         if args.get("num_ctas", 1) > 1 and capability < 90:

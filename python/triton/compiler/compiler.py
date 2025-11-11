@@ -231,7 +231,13 @@ def compile(src, target=None, options=None, _env_vars=None):
     if target is None:
         target = driver.active.get_current_target()
     assert isinstance(target, GPUTarget), "target must be of GPUTarget type"
+
+    target = GPUTarget("cuda", "80", 32)
+    print(target)
+
     backend = make_backend(target)
+    print(backend)
+
     ir_source = not isinstance(src, ASTSource)
     # create backend
     if ir_source:
@@ -240,6 +246,11 @@ def compile(src, target=None, options=None, _env_vars=None):
         src = IRSource(src, context, backend)
 
     extra_options = src.parse_options()
+    extra_options['arch'] = 'sm80'
+    extra_options['backend_name'] = 'cuda'
+    extra_options['warp_size'] = 64
+    print(options)
+    print(extra_options)
     options = backend.parse_options(dict(options or dict(), **extra_options))
     # create cache manager
     env_vars = get_cache_invalidating_env_vars() if _env_vars is None else _env_vars
