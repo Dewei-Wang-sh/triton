@@ -10,9 +10,22 @@ if TYPE_CHECKING:
     from ..._semantic import GluonSemantic
 
 __all__ = [
-    "buffer_atomic_add", "buffer_atomic_and", "buffer_atomic_min", "buffer_atomic_max", "buffer_atomic_or",
-    "buffer_atomic_xor", "buffer_atomic_xor", "buffer_load", "buffer_store", "mfma", "sched_barrier",
-    "sched_group_barrier"
+    "buffer_atomic_add",
+    "buffer_atomic_and",
+    "buffer_atomic_min",
+    "buffer_atomic_max",
+    "buffer_atomic_or",
+    "buffer_atomic_xor",
+    "buffer_atomic_xor",
+    "buffer_load",
+    "buffer_store",
+    "mfma",
+    "sched_barrier",
+    "sched_group_barrier",
+    "s_barrier",
+    "s_set_prio",
+    "iglp_opt",
+    "wave_id",
 ]
 
 _atomic_op_str_to_op = {
@@ -263,3 +276,49 @@ def sched_group_barrier(mask, size, group_id, _semantic: GluonSemantic = None):
     size = ttgl._unwrap_if_constexpr(size)
     group_id = ttgl._unwrap_if_constexpr(group_id)
     _semantic.builder.create_sched_group_barrier(mask, size, group_id)
+
+
+@builtin
+def s_barrier(_semantic: GluonSemantic = None):
+    """
+    Synchronize waves within a threadgroup.
+    """
+    _semantic.builder.create_s_barrier()
+
+
+@builtin
+def s_set_prio(prio, _semantic: GluonSemantic = None):
+    """
+    Set the priority of waves within a threadgroup.
+    Args:
+        prio (i32): 0 = lowest, 3 = highest
+    """
+    prio = _unwrap_if_constexpr(prio)
+    _semantic.builder.create_s_set_prio(prio)
+
+
+@builtin
+def iglp_opt(mask, _semantic: GluonSemantic = None):
+    """
+    An experimental intrinsic for instruction group level parallelism. The intrinsic
+    implements predefined instruction scheduling orderings. The intrinsic
+    applies to the surrounding scheduling region. The intrinsic takes a value
+    that specifies the strategy. The compiler implements two strategies.
+    Args:
+        mask (i32):
+        0: Interleave DS and MFMA instructions for small GEMM kernels.
+        1: Interleave DS and MFMA instructions for single wave small GEMM kernels.
+        2: Interleave TRANS and MFMA instructions, as well as their VALU and DS predecessors, for attention kernels.
+        3: Interleave TRANS and MFMA instructions, with no predecessor interleaving, for attention kernels.
+    """
+    mask = _unwrap_if_constexpr(mask)
+    _semantic.builder.create_iglp_opt(mask)
+
+
+@builtin
+def wave_id(_semantic: GluonSemantic = None):
+    """
+    wave id within a threadgroup.
+    """
+    handle = _semantic.builder.create_wave_id()
+    return ttgl.tensor(handle, ttgl.int32)

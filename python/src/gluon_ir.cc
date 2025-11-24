@@ -837,6 +837,7 @@ void init_gluon_ir(py::module &&m) {
              ValueRange tokens;
              self.create<ttag::AsyncTDMWait>(tokens, num);
            })
+      // move here to reduce merge conflict
       .def("create_sched_barrier",
            [](GluonOpBuilder &self, unsigned mask) {
              self.create<rocdl::SchedBarrier>(mask);
@@ -845,6 +846,26 @@ void init_gluon_ir(py::module &&m) {
            [](GluonOpBuilder &self, unsigned mask, unsigned size,
               unsigned groupId) {
              self.create<rocdl::SchedGroupBarrier>(mask, size, groupId);
+           })
+      .def("create_s_barrier",
+           [](GluonOpBuilder &self) { self.create<rocdl::SBarrierOp>(); })
+      .def("create_s_set_prio",
+           [](GluonOpBuilder &self, unsigned prio) {
+             self.create<rocdl::SetPrioOp>(prio);
+           })
+      .def("create_iglp_opt",
+           [](GluonOpBuilder &self, unsigned mask) {
+             self.create<rocdl::IglpOpt>(mask);
+           })
+      .def("create_wave_id",
+           [](GluonOpBuilder &self) -> Value {
+             // llvm has error in amdgcn_wave_id
+             //    return self.create<rocdl::WaveIdOp>();
+             // hack for now, only consider X
+             Type resTy = self.getBuilder().getIntegerType(32);
+             Value tid = self.create<rocdl::ThreadIdXOp>(resTy);
+             Value waveSize = self.create<arith::ConstantIntOp>(64, 32);
+             return self.create<arith::DivSIOp>(resTy, tid, waveSize);
            })
       .def("create_async_copy_lds_barrier_arrive",
            [](GluonOpBuilder &self, Value mbarrier) {
