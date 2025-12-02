@@ -74,6 +74,11 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
     llvm::sort(sortedBases,
                [](auto a, auto b) { return std::get<2>(a) > std::get<2>(b); });
     for (auto [inDimName, basisIdx, outValue] : sortedBases) {
+      if (std::getenv("MY_DEBUG_LL")) {
+        if (bases[inDimName][basisIdx][outDim.index()] >= desiredSize)
+          bases[inDimName][basisIdx][outDim.index()] = 0;
+          continue;
+        }
       if (actualSize <= desiredSize) {
         break;
       }

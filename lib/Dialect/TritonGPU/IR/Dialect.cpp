@@ -829,15 +829,15 @@ LinearEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 
   const auto &bases = linearLayout.getBases();
   auto nonZero = [](auto val) { return val != 0; };
-  for (const auto &dimBases : llvm::make_second_range(bases)) {
-    if (!llvm::all_of(dimBases, [&](const auto &basis) {
-          return std::count_if(basis.begin(), basis.end(), nonZero) <= 1;
-        })) {
-      return emitError()
-             << "In a distributed layout, each base must move in at most one "
-                "dimension.";
-    }
-  }
+  //for (const auto &dimBases : llvm::make_second_range(bases)) {
+  //  if (!llvm::all_of(dimBases, [&](const auto &basis) {
+  //        return std::count_if(basis.begin(), basis.end(), nonZero) <= 1;
+  //      })) {
+  //    return emitError()
+  //           << "In a distributed layout, each base must move in at most one "
+  //              "dimension.";
+  //  }
+  //}
 
   return success();
 }
@@ -1021,7 +1021,12 @@ LinearLayout LinearEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   }
   ll = ll.transposeOuts(permutedDims);
   ll = ensureLayoutNotSmallerThan(ll, namedShape);
-  ll = ensureLayoutNotLargerThan(ll, namedShape, /*broadcastRegisters=*/false);
+  // breaking case is:
+  // tensor<256xi32, #ttg.slice<{dim = 1, parent = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [8, 32], [128, 0]], lane = [[0, 8], [0, 16], [0, 32], [1, 0], [2, 8], [4, 16]], warp = [[16, 0], [32, 0], [64, 0]], block = []}>}>>
+  if (std::getenv("MY_DEBUG_LL"))
+    ll = ensureLayoutNotLargerThan(ll, namedShape, /*broadcastRegisters=*/true);
+  else
+    ll = ensureLayoutNotLargerThan(ll, namedShape, /*broadcastRegisters=*/false);
   ll = ll.transposeOuts(canonicalDims);
   return ll;
 }

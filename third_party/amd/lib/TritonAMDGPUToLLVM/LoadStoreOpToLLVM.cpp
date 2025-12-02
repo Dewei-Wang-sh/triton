@@ -823,6 +823,8 @@ struct BufferLoadToLocalOpConversion
     bool requiresSrcPtrSwizzling =
         !targetInfo.supportsDirectToLDSScattering() && maybeSwizzledEnc &&
         maybeSwizzledEnc.getMaxPhase() != 1;
+    if (std::getenv("MY_DEBUG"))
+      requiresSrcPtrSwizzling = false;
     if (failed(canWriteCoalesced(rewriter, op, ptrType, dstTy, vec,
                                  requiresSrcPtrSwizzling))) {
       return failure();
