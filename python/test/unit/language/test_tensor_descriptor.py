@@ -1133,15 +1133,15 @@ def matmul_kernel_reshape(a_ptr, b_ptr, c_ptr,  #
 
     a_desc = tl.make_tensor_descriptor(
         a_ptr,
-        shape=[2, M // 2, K],
-        strides=[(M // 2) * K, K, 1],
-        block_shape=[2, BLOCK_SIZE_M // 2, BLOCK_SIZE_K],
+        shape=[1, M // 1, K],
+        strides=[(M // 1) * K, K, 1],
+        block_shape=[1, BLOCK_SIZE_M // 1, BLOCK_SIZE_K],
     )
     b_desc = tl.make_tensor_descriptor(
         b_ptr,
-        shape=[2, N // 2, K],
-        strides=[(N // 2) * K, K, 1],
-        block_shape=[2, BLOCK_SIZE_N // 2, BLOCK_SIZE_K],
+        shape=[1, N // 1, K],
+        strides=[(N // 1) * K, K, 1],
+        block_shape=[1, BLOCK_SIZE_N // 1, BLOCK_SIZE_K],
     )
     c_desc = tl.make_tensor_descriptor(
         c_ptr,
@@ -1155,8 +1155,8 @@ def matmul_kernel_reshape(a_ptr, b_ptr, c_ptr,  #
 
     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
-        offs_am = pid_m * (BLOCK_SIZE_M // 2)
-        offs_bn = pid_n * (BLOCK_SIZE_N // 2)
+        offs_am = pid_m * (BLOCK_SIZE_M // 1)
+        offs_bn = pid_n * (BLOCK_SIZE_N // 1)
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
@@ -1199,7 +1199,7 @@ def test_tensor_descriptor_reshape_matmul(dtype_str, device):
 
     def chunk(X, BLOCK0, BLOCK1):
         s0, s1 = X.shape
-        X_reshaped = (X.reshape(s0 // BLOCK0, 2, BLOCK0 // 2, s1).transpose(1, 0, 2, 3).reshape(2, s0 // 2, s1))
+        X_reshaped = (X.reshape(s0 // BLOCK0, 1, BLOCK0 // 1, s1).transpose(1, 0, 2, 3).reshape(1, s0 // 1, s1))
         return X_reshaped
 
     A_reshaped = chunk(A, BLOCK_SIZE_M, BLOCK_SIZE_K)
