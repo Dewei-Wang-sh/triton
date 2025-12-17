@@ -5,6 +5,7 @@
 #include "amd/lib/TritonAMDGPUTransforms/PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "llvm/Support/Debug.h"
 #include <variant>
 
@@ -118,7 +119,13 @@ ttg::AMDMfmaEncodingAttr getDotEncoding(Value inputValue, unsigned *opIdx,
     OpOperand &use = *inputValue.getUses().begin();
     *opIdx = use.getOperandNumber();
     auto operandType = cast<RankedTensorType>(inputValue.getType());
-    *vecSize = ttg::toLinearLayout(operandType).getNumConsecutiveInOut();
+    auto ll = ttg::toLinearLayout(operandType);
+    auto order = ttg::toLinearEncoding(operandType).getOrder();
+    SmallVector<int> llOrder(order.begin(), order.end());
+    auto transLl = tt::transposeLinearLayout(ll, llOrder);
+    *vecSize = transLl.getNumConsecutiveInOut();
+    if (std::getenv("MY_DEBUG"))
+      *vecSize = ttg::toLinearLayout(operandType).getNumConsecutiveInOut();
     auto dotType = cast<RankedTensorType>(dotOp->getResult(0).getType());
     return dyn_cast<ttg::AMDMfmaEncodingAttr>(dotType.getEncoding());
   }
@@ -212,6 +219,10 @@ std::optional<ttg::SharedEncodingTrait> getSharedEncIfAllUsersAreDotEnc(
         unsigned opIdx;
         unsigned vecSize;
         if (auto mfmaEnc = getDotEncoding(userResult, &opIdx, &vecSize)) {
+          if (opIdx >= 2) {
+            LDBG("skip async_copy for scale operand");
+            continue;
+          }
           LDBG("deduced opIdx: " << opIdx << "; deduced vecSize: " << vecSize);
           tempAttr = mfmaEnc.composeSharedLayoutForOperand(
               cgaLayout, opIdx, srcTy.getShape(), order, vecSize, bitWidth,

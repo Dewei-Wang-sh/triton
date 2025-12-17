@@ -1,0 +1,3 @@
+
+export TRITON_HIP_USE_ASYNC_COPY=1
+export MY_DEBUG_PAD=1

@@ -303,6 +303,142 @@ ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
       ctx, {{paddingInterval, paddingInElems}}, std::move(linearComponent));
 }
 
+
+// On GFX9, lanes in a warp have to write contiguously to shared memory which
+// means we can only add padding at warp boundaries. With 64 lanes, this means:
+// - Padding intervals must be multiples of 256 bytes for 4-byte loads.
+// - Padding intervals must be multiples of 1024 bytes for 16-byte loads.
+// To avoid bank conflicts when reading tensors in MFMA layout, we stagger
+// continuous rows (non contig dimension) by adding padding that shifts their
+// start addresses to different shared memory banks.
+// take Mx64xbf16, k contiguous, kWidth=8, for example: (rX stands for row X)
+// padding here is set to 16 elements (32 bytes) to avoid bank conflicts
+// we need to pack r0,r1,r8,r9,r16,r17,r24,r25 to compose a contiguous tile
+// r0[0+], r0[8+],
+// r1[0+], r1[8+],
+//                 r2[0+], r2[8+],
+//                 r3[0+], r3[8+],
+//                                 r4[0+], r4[8+],
+//                                 r5[0+], r5[8+],
+//                                                 r6[0+], r6[8+],
+//                                                 r7[0+], r7[8+],
+// r8[0+], r8[8+],
+// r9[0+], r9[8+],
+ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4_(
+    ttg::DotOperandEncodingAttr dotOpEnc, ttg::TensorOrMemDesc srcTy,
+    ArrayRef<unsigned> sharedOrder, bool useAsyncCopy) {
+  auto *ctx = srcTy.getContext();
+
+  // NYI: padded layouts for tt.load/local_write which is more flexible
+  if (!useAsyncCopy) {
+    return {};
+  }
+
+  auto mfmaEnc = dyn_cast<ttg::AMDMfmaEncodingAttr>(dotOpEnc.getParent());
+  if (!mfmaEnc) {
+    return {};
+  }
+
+  auto shape = srcTy.getShape();
+  int rank = shape.size();
+
+  if (rank != 2) {
+    return {};
+  }
+
+  unsigned bitWidth = getIntOrFloatOrPtrBitWidth(srcTy.getElementType());
+  unsigned elemByteWidth = std::max(bitWidth / 8u, 1u);
+
+  // NYI: dtypes != 16bit
+  if (elemByteWidth != 2) {
+    return {};
+  }
+
+  auto operandIdx = dotOpEnc.getOpIdx();
+  auto kWidth = dotOpEnc.getKWidth();
+  int kDimIndex = operandIdx == 0 ? 1 : 0;
+  bool isKContig = sharedOrder[0] == kDimIndex;
+  auto mfmaNonKDim = mfmaEnc.getInstrShape()[operandIdx];
+  auto kDim = shape[kDimIndex];
+  auto nonKDim = shape[(kDimIndex + 1) % 2];
+
+  // NYI: padding for scales
+  if (operandIdx >= 2) {
+    return {};
+  }
+
+  if (!llvm::is_contained({16, 32}, mfmaNonKDim)) {
+    return {};
+  }
+
+  if (!llvm::is_contained({4, 8}, kWidth)) {
+    return {};
+  }
+
+  // Determine row(contig) size
+  unsigned contigDim = isKContig ? kDim : nonKDim;
+  unsigned nonContigDim = isKContig ? nonKDim : kDim;
+  constexpr unsigned warpSize = 64;
+
+  // padding and reorder requirement
+  unsigned padding = mfmaNonKDim == 16 ?  (kWidth * 2) : kWidth;
+  // on CDNA4, we have 64 banks which is 256B
+  unsigned wrap = 256 / elemByteWidth / padding;
+  unsigned contigLanes = contigDim / kWidth;
+  unsigned perPhase = ceil(256u , (contigDim * elemByteWidth));
+  unsigned remainingLanes = warpSize / contigLanes / perPhase;
+  unsigned requiredDim = remainingLanes * wrap;
+  if (nonContigDim < requiredDim || contigDim < mfmaNonKDim) {
+    return {};
+  }
+
+
+  // We create linear bases mapping from [contigDim, nonContigDim] -> offset,
+  std::vector<std::vector<int>> bases;
+
+  // Keep contigSize numbers of elments contiguous in shared memory
+  for (int elemLog2 = 0; elemLog2 < llvm::Log2_32(contigDim); elemLog2++)
+    bases.push_back({1 << elemLog2, 0});
+
+  // Add rows in the same phase
+  for (int phaseLog2 = 0; phaseLog2 < llvm::Log2_32(perPhase); phaseLog2++)
+    bases.push_back({0, 1 << phaseLog2});
+
+  // Add rows strided that have the same start offset
+  unsigned paddingInterval = warpSize * kWidth;
+  unsigned requiredNumBases = llvm::Log2_32(paddingInterval);
+  int rowBase = 0;
+  for (rowBase = llvm::Log2_32(wrap); bases.size() < requiredNumBases;
+       rowBase++)
+    bases.push_back({0, 1 << rowBase});
+
+  // Add rows [0, wrap] to complete the tile
+  for (int rowLog2 = llvm::Log2_32(perPhase); rowLog2 < llvm::Log2_32(wrap); rowLog2++)
+    bases.push_back({0, 1 << rowLog2});
+
+  // Add remaining rows
+  for (; rowBase < llvm::Log2_32(nonContigDim); rowBase++)
+    bases.push_back({0, 1 << rowBase});
+
+  // Swap bases to match srcTy dimension order
+  if ((isKContig && kDimIndex == 1) || (!isKContig && kDimIndex == 0)) {
+    for (auto &p : bases)
+      std::swap(p[0], p[1]);
+  }
+
+  auto cgaLayout = ttg::getCGALayout(srcTy.getEncoding());
+  triton::LinearLayout linearComponent(
+      {
+          {StringAttr::get(ctx, "offset"), bases},
+      },
+      triton::standardOutDimNames(ctx, rank));
+  linearComponent = triton::gpu::combineCtaCgaWithShape(
+      linearComponent, cgaLayout, srcTy.getShape());
+
+  return ttg::PaddedSharedEncodingAttr::get(
+      ctx, {{paddingInterval, padding}}, std::move(linearComponent));
+}
+
 ttg::PaddedSharedEncodingAttr
 composePaddedLayout(const tt::AMD::TargetInfo &targetInfo,
                     ttg::DotOperandEncodingAttr dotOpEnc,
@@ -310,6 +446,9 @@ composePaddedLayout(const tt::AMD::TargetInfo &targetInfo,
                     bool useAsyncCopy) {
   if (useAsyncCopy &&
       targetInfo.getISAFamily() == triton::AMD::ISAFamily::CDNA4) {
+    if (std::getenv("MY_DEBUG_PAD"))
+      return composePaddedLayoutForAsyncCopyCDNA4_(dotOpEnc, srcTy, sharedOrder,
+                                                useAsyncCopy);
     return composePaddedLayoutForAsyncCopyCDNA4(dotOpEnc, srcTy, sharedOrder,
                                                 useAsyncCopy);
   }

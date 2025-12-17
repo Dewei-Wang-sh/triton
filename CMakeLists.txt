@@ -290,15 +290,15 @@ if(TRITON_BUILD_PYTHON_MODULE)
                   ${PYTHON_SRC_PATH}/specialize.cc)
 
   # Link triton with its dependencies
-  target_link_libraries(triton PRIVATE ${TRITON_LIBRARIES})
+  target_link_libraries(triton PUBLIC ${TRITON_LIBRARIES})
   if(WIN32)
     target_link_libraries(triton PRIVATE ${CMAKE_DL_LIBS})
     set_target_properties(triton PROPERTIES SUFFIX ".pyd")
     set_target_properties(triton PROPERTIES PREFIX "lib")
   else()
-    target_link_libraries(triton PRIVATE z)
+    target_link_libraries(triton PUBLIC z)
   endif()
-  target_link_options(triton PRIVATE ${LLVM_LDFLAGS})
+  target_link_options(triton PUBLIC ${LLVM_LDFLAGS})
 
   if (NOT DEFINED LLVM_SYSPATH)
       message(FATAL_ERROR "LLVM_SYSPATH must be set.")
@@ -327,7 +327,7 @@ if(TRITON_BUILD_PYTHON_MODULE AND NOT WIN32)
     set(PYTHON_LDFLAGS "-undefined dynamic_lookup")
   endif()
 
-  target_link_options(triton PRIVATE ${PYTHON_LDFLAGS})
+  target_link_options(triton PUBLIC ${PYTHON_LDFLAGS})
 endif()
 
 if(NOT TRITON_BUILD_PYTHON_MODULE)
