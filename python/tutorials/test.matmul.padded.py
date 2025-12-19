@@ -103,8 +103,11 @@ def matmul_kernel(
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
+
+    cnt = tl.cdiv(K, BLOCK_SIZE_K)
+    tl.assume(cnt > 2)
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(0, cnt):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         accumulator = tl.dot(a, b, accumulator)
@@ -184,6 +187,7 @@ def matmul(a, b, BM=128, BN=128, BK=64, nonKDim=32, activation=""):
         matrix_instr_nonkdim=nonKDim,
         num_warps=4,
         num_stages=2,
+        kpack=1,
     )
     return c
 
@@ -197,18 +201,29 @@ def matmul(a, b, BM=128, BN=128, BK=64, nonKDim=32, activation=""):
 #torch.manual_seed(0)
 #a = torch.rand((512, 512), device=DEVICE, dtype=torch.float16) - 0.5
 #b = torch.rand((512, 512), device=DEVICE, dtype=torch.float16) - 0.5
-#triton_output = matmul(a, b)
+#  #triton_output = matmul(a, b)
 #torch_output = torch.matmul(a, b)
 #
 #for BM in [32, 64, 128]:
-#    for BN in [128]:
-#        for BK in [64, 128]:
+#    for BN in [64, 128]:
+#        for BK in [32, 64, 128]:
 #            for nonKDim in [16, 32]:
+##for BM in [256]:
+##    for BN in [256]:
+##        for BK in [16]:
+##            for nonKDim in [16]:
 #                triton_output = matmul(a, b, BM, BN, BK, nonKDim)
 #                if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
 #                    print("✅ Triton and Torch match")
 #                else:
 #                    print("❌ Triton and Torch differ")
+##for i in range(512):
+##    for j in range(512):
+##        out = torch_output[i][j]
+##        ref = triton_output[i][j]
+##        delta = abs(out-ref)
+##        if delta > 1e-2:
+##          print(f"{i=}, {j=}, {delta=}")
 
 
 
@@ -218,10 +233,10 @@ configs = []
 for BM in [128]:
     for BN in [128]:
         for BK in [64]:
-            for nonKDim in [16]:
+            for nonKDim in [32]:
 #for BM in [32, 64, 128]:
-#    for BN in [128]:
-#        for BK in [64, 128]:
+#    for BN in [64, 128]:
+#        for BK in [32, 64, 128]:
 #            for nonKDim in [16, 32]:
                 configs.append(
                     triton.testing.Benchmark(

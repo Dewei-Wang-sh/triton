@@ -375,12 +375,22 @@ ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4_(
     return {};
   }
 
+  if (std::getenv("SEL_SWIZ")) {
+    if (std::getenv("A_SWIZ")) {
+      if (isKContig)
+        return {};
+    } else {
+      if (!isKContig)
+        return {};
+    }
+  }
+
   // Determine row(contig) size
   unsigned contigDim = isKContig ? kDim : nonKDim;
   unsigned nonContigDim = isKContig ? nonKDim : kDim;
   constexpr unsigned warpSize = 64;
 
-  // padding and reorder to compose a contiguous tile
+  // padding and reorder of rows
   unsigned padding = 0;
   if (isKContig) {
     padding = mfmaNonKDim == 16 ? (kWidth * 2) : kWidth;
@@ -397,11 +407,12 @@ ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4_(
     return {};
   }
 
-  if (std::getenv("MY_WRAP")) {
-    if (!isKContig)
-      wrap=16;
+  // use 16 rows wrap if block large enough
+  unsigned bestWrap = 16;
+  if (nonContigDim >= warpSize / contigLanes * bestWrap) {
+    wrap = std::max(bestWrap, wrap);
+    perPhase = 1;
   }
-
 
   // We create linear bases mapping from [contigDim, nonContigDim] -> offset,
   std::vector<std::vector<int>> bases;
@@ -410,11 +421,11 @@ ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4_(
   for (int elemLog2 = 0; elemLog2 < llvm::Log2_32(contigDim); elemLog2++)
     bases.push_back({1 << elemLog2, 0});
 
-  // Add rows in the same phase
+  // Add rows in the same phase which has the same start offset
   for (int phaseLog2 = 0; phaseLog2 < llvm::Log2_32(perPhase); phaseLog2++)
     bases.push_back({0, 1 << phaseLog2});
 
-  // Add rows strided that have the same start offset
+  // Add rows strided which has the same start offset
   unsigned paddingInterval = warpSize * kWidth;
   unsigned requiredNumBases = llvm::Log2_32(paddingInterval);
   int rowBase = 0;
@@ -422,7 +433,7 @@ ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4_(
        rowBase++)
     bases.push_back({0, 1 << rowBase});
 
-  // Add rows [0, wrap] to complete the tile
+  // Add rows [0, wrap]
   for (int rowLog2 = llvm::Log2_32(perPhase); rowLog2 < llvm::Log2_32(wrap); rowLog2++)
     bases.push_back({0, 1 << rowLog2});
 
