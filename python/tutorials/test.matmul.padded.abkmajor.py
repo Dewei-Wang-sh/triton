@@ -68,7 +68,7 @@ def matmul_kernel(
         # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
         # by to get the element one row down (A has M rows).
         stride_am, stride_ak,  #
-        stride_bk, stride_bn,  #
+        stride_bn, stride_bk,  #
         stride_cm, stride_cn,
         # Meta-parameters
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
@@ -101,13 +101,13 @@ def matmul_kernel(
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    b_ptrs = b_ptr + (offs_k[None, :] * stride_bk + offs_bn[:, None] * stride_bn)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        accumulator = tl.dot(a, b, accumulator)
+        b = tl.load(b_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(a, b.T, accumulator)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
     if ACTIVATION == "leaky_relu":
@@ -159,12 +159,12 @@ def leaky_relu(x):
 #        num_stages=2,
 #    )
 #    return c
-def matmul(a, b, BM=128, BN=128, BK=64, nonKDim=32, activation=""):
+def matmul(a, b, BM=256, BN=256, BK=64, nonKDim=16, activation=""):
     # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    #assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
-    K, N = b.shape
+    N, K = b.shape
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
 
@@ -195,10 +195,10 @@ def matmul(a, b, BM=128, BN=128, BK=64, nonKDim=32, activation=""):
 # We can test our custom matrix multiplication operation against a native torch implementation (i.e., cuBLAS).
 
 #torch.manual_seed(0)
-#a = torch.rand((512, 512), device=DEVICE, dtype=torch.float16) - 0.5
-#b = torch.rand((512, 512), device=DEVICE, dtype=torch.float16) - 0.5
+#a = torch.rand((512, 256), device=DEVICE, dtype=torch.float16) - 0.5
+#b = torch.rand((512, 256), device=DEVICE, dtype=torch.float16) - 0.5
 #triton_output = matmul(a, b)
-#torch_output = torch.matmul(a, b)
+#torch_output = torch.matmul(a, b.T)
 #
 #for BM in [32, 64, 128]:
 #    for BN in [128]:
@@ -212,17 +212,19 @@ def matmul(a, b, BM=128, BN=128, BK=64, nonKDim=32, activation=""):
 
 
 
+
+
 ref_lib = 'cuBLAS' if is_cuda() else 'rocBLAS'
 
 configs = []
-for BM in [128]:
-    for BN in [128]:
-        for BK in [64]:
-            for nonKDim in [16]:
-#for BM in [32, 64, 128]:
-#    for BN in [128]:
-#        for BK in [64, 128]:
+#for BK in [64]:
+#    for BM in [128]:
+#        for BN in [128]:
 #            for nonKDim in [16, 32]:
+for BM in [32, 64, 128]:
+    for BN in [128]:
+        for BK in [64, 128]:
+            for nonKDim in [16, 32]:
                 configs.append(
                     triton.testing.Benchmark(
                         x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot

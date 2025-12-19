@@ -380,16 +380,26 @@ ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4_(
   unsigned nonContigDim = isKContig ? nonKDim : kDim;
   constexpr unsigned warpSize = 64;
 
-  // padding and reorder requirement
-  unsigned padding = mfmaNonKDim == 16 ?  (kWidth * 2) : kWidth;
+  // padding and reorder to compose a contiguous tile
+  unsigned padding = 0;
+  if (isKContig) {
+    padding = mfmaNonKDim == 16 ? (kWidth * 2) : kWidth;
+  } else {
+    padding = mfmaNonKDim == 16 ? 16 : 32;
+  }
   // on CDNA4, we have 64 banks which is 256B
   unsigned wrap = 256 / elemByteWidth / padding;
   unsigned contigLanes = contigDim / kWidth;
   unsigned perPhase = ceil(256u , (contigDim * elemByteWidth));
   unsigned remainingLanes = warpSize / contigLanes / perPhase;
   unsigned requiredDim = remainingLanes * wrap;
-  if (nonContigDim < requiredDim || contigDim < mfmaNonKDim) {
+  if (nonContigDim < requiredDim) {
     return {};
+  }
+
+  if (std::getenv("MY_WRAP")) {
+    if (!isKContig)
+      wrap=16;
   }
 
 
@@ -419,6 +429,21 @@ ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4_(
   // Add remaining rows
   for (; rowBase < llvm::Log2_32(nonContigDim); rowBase++)
     bases.push_back({0, 1 << rowBase});
+
+  // fixup: for nonKContig and mfma16 we exchange row4 and row8 to avoid bank
+  // conflicts
+  if (!isKContig && mfmaNonKDim == 16) {
+    unsigned row4 = 0;
+    unsigned row8 = 0;
+    for (unsigned i = 0; i < bases.size(); i++) {
+      if (bases[i][1] == 8)
+        row8 = i;
+      if (bases[i][1] == 4)
+        row4 = i;
+    }
+    assert(row4 != 0 && row8 != 0);
+    std::swap(bases[row4], bases[row8]);
+  }
 
   // Swap bases to match srcTy dimension order
   if ((isKContig && kDimIndex == 1) || (!isKContig && kDimIndex == 0)) {
