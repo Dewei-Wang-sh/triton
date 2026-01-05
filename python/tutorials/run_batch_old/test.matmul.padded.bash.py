@@ -2,6 +2,7 @@ import torch
 
 import triton
 import triton.language as tl
+import argparse
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -10,51 +11,6 @@ def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
 
-# k=64, mfma16x16
-#def get_hip_autotune_config():
-#    sizes = [
-#        #{'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1},
-#        #{'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1},
-#        {'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1},
-#    ]
-#    return [triton.Config(s | {'matrix_instr_nonkdim': 16}, num_warps=4, num_stages=2) for s in sizes]
-
-# k=64, mfma32x32
-#def get_hip_autotune_config():
-#    sizes = [
-#        #{'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1},
-#        {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1},
-#        # m=32 not supported
-#    ]
-#    return [triton.Config(s | {'matrix_instr_nonkdim': 32}, num_warps=4, num_stages=2) for s in sizes]
-
-# k=128, mfma16x16
-#def get_hip_autotune_config():
-#    sizes = [
-#        #{'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1},
-#        {'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1},
-#    ]
-#    return [triton.Config(s | {'matrix_instr_nonkdim': 16}, num_warps=4, num_stages=2) for s in sizes]
-
-# k=128, mfma32x32
-def get_hip_autotune_config():
-    sizes = [
-        #{'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1},
-        #{'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1},
-        # m=32 should go to swizzle
-        {'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1},
-    ]
-    return [triton.Config(s | {'matrix_instr_nonkdim': 32}, num_warps=4, num_stages=2) for s in sizes]
-
-def get_autotune_config():
-    return get_hip_autotune_config()
-
-
-# disable autotune for benchmark
-#@triton.autotune(
-#    configs=get_autotune_config(),
-#    key=['M', 'N', 'K'],
-#)
 
 
 
@@ -132,36 +88,7 @@ def leaky_relu(x):
     return tl.where(x >= 0, x, 0.01 * x)
 
 
-# %%
-# We can now create a convenience wrapper function that only takes two input tensors,
-# and (1) checks any shape constraint; (2) allocates the output; (3) launches the above kernel.
 
-
-#def matmul(a, b, activation="", extra_args={}):
-#    # Check constraints.
-#    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-#    assert a.is_contiguous(), "Matrix A must be contiguous"
-#    M, K = a.shape
-#    K, N = b.shape
-#    # Allocates output.
-#    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
-#    if not extra_args:
-#        extra_args = {"BLOCK_SIZE_M":256, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "matrix_instr_nonkdim":16}
-#
-#    # 1D launch kernel where each block gets its own program.
-#    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-#    matmul_kernel[grid](
-#        a, b, c,  #
-#        M, N, K,  #
-#        a.stride(0), a.stride(1),  #
-#        b.stride(0), b.stride(1),  #
-#        c.stride(0), c.stride(1),  #
-#        ACTIVATION=activation, #
-#        **extra_args,
-#        num_warps=4,
-#        num_stages=2,
-#    )
-#    return c
 def matmul(a, b, BM=128, BN=128, BK=64, nonKDim=32, activation=""):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -194,6 +121,21 @@ def matmul(a, b, BM=128, BN=128, BK=64, nonKDim=32, activation=""):
     )
     return c
 
+# Parse command line arguments for M, N, K
+parser = argparse.ArgumentParser(description='Triton Matrix Multiplication Benchmark')
+parser.add_argument('--BM', type=int, default=64, help='Matrix Block M (default: 64)')
+parser.add_argument('--BN', type=int, default=64, help='Matrix Block N (default: 64)')
+parser.add_argument('--BK', type=int, default=64, help='Matrix Block K (default: 64)')
+parser.add_argument('--nonKDim', type=int, default=16, help='Matrix MFMA nonKDim (default: 16)')
+args = parser.parse_args()
+
+bm = args.BM
+bn = args.BN
+bk = args.BK
+nonKDim = args.nonKDim
+
+print(f"Running benchmark with BM={bm}, BN={bn}, BK={bk}, MFMA_nonKDim{nonKDim}")
+
 
 # %%
 # Unit Test
@@ -201,32 +143,15 @@ def matmul(a, b, BM=128, BN=128, BK=64, nonKDim=32, activation=""):
 #
 # We can test our custom matrix multiplication operation against a native torch implementation (i.e., cuBLAS).
 
-#torch.manual_seed(0)
-#a = torch.rand((512, 512), device=DEVICE, dtype=torch.float16) - 0.5
-#b = torch.rand((512, 512), device=DEVICE, dtype=torch.float16) - 0.5
-#  #triton_output = matmul(a, b)
-#torch_output = torch.matmul(a, b)
-#
-#for BM in [32, 64, 128]:
-#    for BN in [64, 128]:
-#        for BK in [32, 64, 128]:
-#            for nonKDim in [16, 32]:
-##for BM in [256]:
-##    for BN in [256]:
-##        for BK in [16]:
-##            for nonKDim in [16]:
-#                triton_output = matmul(a, b, BM, BN, BK, nonKDim)
-#                if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
-#                    print("✅ Triton and Torch match")
-#                else:
-#                    print("❌ Triton and Torch differ")
-##for i in range(512):
-##    for j in range(512):
-##        out = torch_output[i][j]
-##        ref = triton_output[i][j]
-##        delta = abs(out-ref)
-##        if delta > 1e-2:
-##          print(f"{i=}, {j=}, {delta=}")
+torch.manual_seed(0)
+a = torch.rand((512, 512), device=DEVICE, dtype=torch.float16) - 0.5
+b = torch.rand((512, 512), device=DEVICE, dtype=torch.float16) - 0.5
+triton_output = matmul(a, b, bm, bn, bk, nonKDim)
+torch_output = torch.matmul(a, b)
+if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
+    print("✅ Triton and Torch match")
+else:
+    print("❌ Triton and Torch differ")
 
 
 
@@ -234,18 +159,10 @@ ref_lib = 'cuBLAS' if is_cuda() else 'rocBLAS'
 
 configs = []
 #prof
-for BM in [64]:
-    for BN in [64]:
-        for BK in [256]:
-            for nonKDim in [32]: #16
-#for BM in [32, 64, 128]:
-#    for BN in [64, 128]:
-#        for BK in [32, 64, 128]:
-#            for nonKDim in [16, 32]:
-#for BM in [64, 128]:
-#    for BN in [64, 128]:
-#        for BK in [64, 128]:
-#            for nonKDim in [32]:
+for BM in [bm]:
+    for BN in [bn]:
+        for BK in [bk]:
+            for nonKDim in [nonKDim]:
                 configs.append(
                     triton.testing.Benchmark(
                         x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot

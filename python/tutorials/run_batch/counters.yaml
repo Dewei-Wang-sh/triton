@@ -1,0 +1,4 @@
+jobs:
+  - pmc:
+      - SQ_LDS_BANK_CONFLICT
+      - SQ_LDS_DATA_FIFO_FULL

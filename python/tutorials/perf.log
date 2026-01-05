@@ -2,79 +2,118 @@
 
 old 
 matmul-performance-BM32-BN128-BK64-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       454.249787
 matmul-performance-BM32-BN128-BK64-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       453.919753
 matmul-performance-BM64-BN128-BK64-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       694.550064
 matmul-performance-BM64-BN128-BK64-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0        668.99152
 matmul-performance-BM128-BN128-BK64-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       948.633417
 matmul-performance-BM128-BN128-BK64-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       947.848353
 matmul-performance-BM32-BN128-BK128-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       296.983262
 matmul-performance-BM32-BN128-BK128-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       358.695781
 matmul-performance-BM64-BN128-BK128-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       494.166098
 matmul-performance-BM64-BN128-BK128-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       472.295554
 matmul-performance-BM128-BN128-BK128-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       678.101416
 matmul-performance-BM128-BN128-BK128-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       716.417417
 
 
 # my
 
 matmul-performance-BM32-BN128-BK64-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       541.093971
 matmul-performance-BM32-BN128-BK64-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       462.754322
 matmul-performance-BM64-BN128-BK64-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       802.980566
 matmul-performance-BM64-BN128-BK64-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       775.610472
 matmul-performance-BM128-BN128-BK64-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       936.736721
 matmul-performance-BM128-BN128-BK64-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       926.631771
 matmul-performance-BM32-BN128-BK128-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       292.271579
 matmul-performance-BM32-BN128-BK128-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       346.156353
 matmul-performance-BM64-BN128-BK128-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       454.611154
 matmul-performance-BM64-BN128-BK128-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       527.147489
 matmul-performance-BM128-BN128-BK128-mfma16:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0        669.90452
 matmul-performance-BM128-BN128-BK128-mfma32:
-        M       N       K  Triton (TFLOPS)
 0  4096.0  4096.0  4096.0       673.913609
+
+
+
+
+
+# my
+matmul-performance-BM64-BN64-BK64-mfma32:
+0  4096.0  4096.0  4096.0       607.432762
+matmul-performance-BM64-BN64-BK128-mfma32:
+0  4096.0  4096.0  4096.0       615.981181
+matmul-performance-BM64-BN128-BK64-mfma32:
+0  4096.0  4096.0  4096.0       794.068466
+matmul-performance-BM64-BN128-BK128-mfma32:
+0  4096.0  4096.0  4096.0       470.355971
+matmul-performance-BM128-BN64-BK64-mfma32:
+0  4096.0  4096.0  4096.0       788.062874
+matmul-performance-BM128-BN64-BK128-mfma32:
+0  4096.0  4096.0  4096.0        511.91124
+matmul-performance-BM128-BN128-BK64-mfma32:
+0  4096.0  4096.0  4096.0       947.848353
+matmul-performance-BM128-BN128-BK128-mfma32:
+0  4096.0  4096.0  4096.0        753.99494
+
+
+
+
+# old
+matmul-performance-BM64-BN64-BK64-mfma32:
+0  4096.0  4096.0  4096.0       483.799433
+matmul-performance-BM64-BN64-BK128-mfma32:
+0  4096.0  4096.0  4096.0       616.644466
+matmul-performance-BM64-BN128-BK64-mfma32:
+0  4096.0  4096.0  4096.0       680.722786
+matmul-performance-BM64-BN128-BK128-mfma32:
+0  4096.0  4096.0  4096.0       470.483181
+matmul-performance-BM128-BN64-BK64-mfma32:
+0  4096.0  4096.0  4096.0       650.503133
+matmul-performance-BM128-BN64-BK128-mfma32:
+0  4096.0  4096.0  4096.0       511.454048
+matmul-performance-BM128-BN128-BK64-mfma32:
+0  4096.0  4096.0  4096.0       949.157451
+matmul-performance-BM128-BN128-BK128-mfma32:
+0  4096.0  4096.0  4096.0       753.825413
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
