@@ -233,6 +233,7 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         use_async_copy = is_async_copy_enabled(options.arch)
+        use_async_copy = False
         use_block_pingpong = is_pingpong_schedule_enabled(options.arch, use_async_copy)
 
         amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
@@ -423,6 +424,9 @@ class HIPBackend(BaseBackend):
                 llvm.link_extern_libs(llvm_mod, paths)
 
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', [], options.enable_fp_fusion)
+
+        #print("after llvm optimize")
+        #print(llvm_mod)
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during

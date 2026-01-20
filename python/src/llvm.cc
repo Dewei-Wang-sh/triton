@@ -204,6 +204,13 @@ translateLLVMIRToMIR(llvm::Module &module, const std::string &triple,
 
   // options
   auto options = llvm::cl::getRegisteredOptions();
+  if (std::getenv("TEST_GREEDY")) {
+    auto optIt = options.find("greedy-reverse-local-assignment");
+    if (optIt != options.end()) {
+      auto optPtr = static_cast<llvm::cl::opt<bool> *>(optIt->second);
+      *optPtr = true;
+    }
+  }
   for (std::string flag : flags) {
     auto *shortPtr = static_cast<llvm::cl::opt<bool> *>(options[flag]);
     assert(shortPtr);

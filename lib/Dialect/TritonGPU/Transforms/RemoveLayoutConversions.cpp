@@ -17,11 +17,14 @@
 #include "mlir/Transforms/RegionUtils.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/LinearLayout.h"
 #include <deque>
 
 namespace mlir::triton::gpu {
@@ -1629,6 +1632,20 @@ public:
     });
   }
 
+  bool getInterWarpReuse(LinearLayout ll, MLIRContext *context) {
+    auto kWarp = StringAttr::get(context, "warp");
+    const auto &warpBases = ll.getBases().lookup(kWarp);
+    std::set<std::vector<int32_t>> uniqueWarpBases{warpBases.begin(),
+                                                           warpBases.end()};
+    bool haveZeroBase =
+        llvm::any_of(warpBases, [](const std::vector<int32_t> &base) {
+          return llvm::all_of(base, [](int32_t v) { return v == 0; });
+        });
+    if (uniqueWarpBases.size() < warpBases.size() || haveZeroBase)
+      return true;
+    return false;
+  }
+
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
@@ -1670,6 +1687,92 @@ public:
       DBGS() << "Module after hoisting converts:\n";
       m.dump();
     });
+    cleanupConvertOps();
+
+    if (std::getenv("MY_DEBUG")) {
+    // after hoistConvert, it's often the case that load is followed by convert.
+    // This opens a chance to re-examine whether to preserve the anchor load
+    // op's layout or use the layout propagated from backward.
+    m.walk([&](FuncOp funcOp) {
+      SmallVector<ConvertLayoutOp> convertOps;
+      funcOp.walk(
+          [&](ConvertLayoutOp convertOp) { convertOps.push_back(convertOp); });
+      LayoutRematerialization layoutRemat(funcOp);
+      for (ConvertLayoutOp convertOp : convertOps) {
+        auto src = convertOp.getSrc();
+        auto dst = convertOp.getResult();
+        if (auto loadOp = src.getDefiningOp<LoadOp>()) {
+          if (!loadOp->hasOneUse())
+            continue;
+          auto srcEncoding =
+              cast<RankedTensorType>(src.getType()).getEncoding();
+          auto dstEncoding =
+              cast<RankedTensorType>(dst.getType()).getEncoding();
+          auto srcLLEnc = toLinearEncoding(src.getType());
+          LinearLayout srcLL = srcLLEnc.getLinearLayout();
+          // SmallVector<int> srcOrder(srcLLEnc.getOrder().begin(),
+          // srcLLEnc.getOrder().end()); auto srcTrans =
+          // transposeLinearLayout(srcLL, llvm::ArrayRef(srcOrder));
+          auto srcOrder = llvm::to_vector(
+              llvm::map_range(srcLLEnc.getOrder(),
+                              [](unsigned x) { return static_cast<int>(x); }));
+          auto srcTrans = transposeLinearLayout(srcLL, srcOrder);
+          auto dstLLEnc = toLinearEncoding(dst.getType());
+          LinearLayout dstLL = dstLLEnc.getLinearLayout();
+          // SmallVector<int> dstOrder(dstLLEnc.getOrder().begin(),
+          // dstLLEnc.getOrder().end()); auto dstTrans =
+          // mlir::triton::transposeLinearLayout(dstLL,
+          // llvm::ArrayRef(dstOrder));
+          auto dstOrder = llvm::to_vector(
+              llvm::map_range(dstLLEnc.getOrder(),
+                              [](unsigned x) { return static_cast<int>(x); }));
+          auto dstTrans = mlir::triton::transposeLinearLayout(dstLL, dstOrder);
+          unsigned srcVecSize = srcTrans.getNumConsecutiveInOut();
+          unsigned dstVecSize = dstTrans.getNumConsecutiveInOut();
+          bool interWarpReuse = getInterWarpReuse(dstLL, context);
+          // if there is no data reuse between warps and the source vector size
+          // is less than or equal to twice the destination vector size, we use
+          // the layout from backward propagation to avoid the convert.
+
+          // cacheLine??
+          // add hack for large tile
+          auto size = mlir::product(src.getType().getShape());
+          if (!interWarpReuse && srcVecSize <= dstVecSize * 2 && size <= 4096) {
+            // backPropagateLayoutThroughLoad(loadOp, dstEncoding);
+            // 1. Take a backward slice of all the tensor dependencies that can
+            // be rematerialized.
+            SetVector<Value> slice;
+            DenseMap<Value, Attribute> layout;
+            LogicalResult result = layoutRemat.getConvertBackwardSlice(
+                convertOp.getSrcMutable(), dstEncoding, slice, layout, nullptr);
+            if (result.failed()) {
+              LDBG("  getRematerializableSlice failed");
+              continue;
+            }
+            layoutRemat.rewriteSlice(slice, layout, convertOp);
+          }
+        }
+      }
+    });
+    }
+
+
+    // 2nd round remat
+    else {
+    do {
+      changed = false;
+      // 2. For remaining convert ops, try to rematerialize the slice of
+      // producer operation to avoid having to convert.
+      changed = backwardRematerialization(m);
+      LLVM_DEBUG({
+        DBGS() << "Module after backward remat:\n";
+        m.dump();
+      });
+
+      // Cleanup dummy converts created during backward remat.
+      cleanupConvertOps();
+    } while (changed);
+    }
 
     // 4. Apply clean up patterns to remove remove dead convert and dead code
     // generated by the previous transformations.

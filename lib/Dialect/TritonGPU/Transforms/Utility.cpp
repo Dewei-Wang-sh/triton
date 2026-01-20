@@ -606,6 +606,9 @@ bool isExpensiveLoadOrStore(Operation *op) {
   int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
   if (ptrType.getNumElements() < numWarps * threadsPerWarp)
     return false;
+  // Case 3: annotated cheap load e.g. scale
+  if (op->hasAttr("cheap"))
+    return false;
   return true;
 }
 
