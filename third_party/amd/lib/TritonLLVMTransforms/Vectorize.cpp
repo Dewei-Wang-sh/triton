@@ -158,10 +158,10 @@ bool isBlockConstantPattern(ArrayRef<Value> values, size_t blockSize) {
 }
 
 // Infer the best sub-vector size
-size_t inferSubVectorSize(ArrayRef<Value> values) {
+std::pair<size_t, bool> inferSubVectorSize(ArrayRef<Value> values) {
   size_t N = values.size();
   if (N <= 1)
-    return N;
+    return {N, false};
 
   assert(llvm::isPowerOf2_64(N) && "Total size must be power of two");
   int logN = llvm::Log2_64(N);
@@ -169,17 +169,17 @@ size_t inferSubVectorSize(ArrayRef<Value> values) {
     size_t subSize = size_t{1} << i;
     // Block-constant works for any size (including full vector)
     if (isBlockConstantPattern(values, subSize)) {
-      return subSize;
+      return {subSize, false};
     }
   }
   for (int i = 1; i < logN; ++i) {
     size_t subSize = size_t{1} << i;
     // Repeating pattern only counts if it actually repeats (≥2 times)
     if (isRepeatingPattern(values, subSize)) {
-      return subSize;
+      return {subSize, true};
     }
   }
-  return 1;
+  return {1, false};
 }
 
 // Split values into chunks of size `subSize`
@@ -199,18 +199,34 @@ bool groupValuesIntoChunks(ArrayRef<Value> values, size_t subSize,
 }
 
 Value vectorizeFromScalar(Value scalar, int64_t numElements) {
-  OpBuilder b(scalar.getDefiningOp());
-  Location loc = scalar.getLoc();
+  auto op = scalar.getDefiningOp();
+  OpBuilder b(op);
+  b.setInsertionPointAfter(op);
+  Location loc = op->getLoc();
   auto scalarTy = scalar.getType();
   auto vecTy = VectorType::get(numElements, scalarTy);
 
   /// vectorize scalar constant
-  if (auto cst = dyn_cast<LLVM::ConstantOp>(scalar.getDefiningOp())) {
-    Attribute attr = cst.getValue();
-    auto vecAttr =
-        SplatElementsAttr::get(vecTy, attr); // attr.cast<TypedAttr>()
-    auto cstVec = LLVM::ConstantOp::create(b, loc, vecTy, vecAttr);
-    return cstVec;
+  if (auto cst = dyn_cast<LLVM::ConstantOp>(op)) {
+    if (scalarTy.isFloat()) {
+      APFloat cstVal(0.0);
+      (void)matchPattern(scalar, m_ConstantFloat(&cstVal));
+      auto fpAttr = b.getFloatAttr(scalarTy, cstVal);
+      auto dense =
+          DenseElementsAttr::get(cast<mlir::ShapedType>(vecTy), fpAttr);
+      auto cstVec = LLVM::ConstantOp::create(b, loc, vecTy, dense);
+      return cstVec;
+    } else {
+      assert(scalarTy.isInteger() &&
+             "only support float or integer scalar vectorization");
+      APInt cstVal;
+      (void)matchPattern(scalar, m_ConstantInt(&cstVal));
+      auto intAttr = b.getIntegerAttr(scalarTy, cstVal.getSExtValue());
+      auto dense =
+          DenseElementsAttr::get(cast<mlir::ShapedType>(vecTy), intAttr);
+      auto cstVec = LLVM::ConstantOp::create(b, loc, vecTy, dense);
+      return cstVec;
+    }
   }
   /// vectorize scalar value
   Value undef = LLVM::UndefOp::create(b, loc, vecTy);
@@ -229,8 +245,10 @@ Value vectorizeFromSubVector(SmallVector<Value> subVectors) {
   assert(!subVectors.empty() && "No sub-vectors provided");
   assert(llvm::isPowerOf2_64(subVectors.size()) &&
          "Number of sub-vectors must be power of two");
-  OpBuilder b(subVectors[0].getDefiningOp());
-  Location loc = subVectors[0].getDefiningOp()->getLoc();
+  auto op = subVectors.back().getDefiningOp();
+  OpBuilder b(op);
+  b.setInsertionPointAfter(op);
+  Location loc = op->getLoc();
 
   // Work on a mutable list
   SmallVector<Value> current = subVectors;
@@ -267,9 +285,10 @@ Value vectorizeFromSubVector(SmallVector<Value> subVectors) {
 
 // generic vectorize
 Value vectorizeFromScalars(SmallVectorImpl<Value> &scalars) {
-  OpBuilder b(scalars[0].getDefiningOp());
-  auto loc = scalars[0].getLoc();
-  auto i32Type = b.getI32Type();
+  auto op = scalars.back().getDefiningOp();
+  OpBuilder b(op);
+  b.setInsertionPointAfter(op);
+  auto loc = op->getLoc();
   auto vecType = VectorType::get(scalars.size(), scalars[0].getType());
 
   Value vector = LLVM::UndefOp::create(b, loc, vecType);
@@ -278,6 +297,7 @@ Value vectorizeFromScalars(SmallVectorImpl<Value> &scalars) {
         b, loc, b.getI32Type(), b.getI32IntegerAttr(static_cast<int32_t>(i)));
     vector =
         LLVM::InsertElementOp::create(b, loc, vecType, vector, scalars[i], idx);
+    // visitedInsert.insert(vector.getDefiningOp());
   }
   return vector;
 }
@@ -285,53 +305,88 @@ Value vectorizeFromScalars(SmallVectorImpl<Value> &scalars) {
 // create llvm op with vectorized src (binary ops)
 Value createLLVMVecOpBinary(OpBuilder &b, Location loc, StringRef opName,
                             Value lhs, Value rhs, Type type) {
-  return llvm::StringSwitch<Value>(opName)
-      // Integer arithmetic
-      .Case("add", LLVM::AddOp::create(b, loc, type, lhs, rhs))
-      .Case("sub", LLVM::SubOp::create(b, loc, type, lhs, rhs))
-      .Case("mul", LLVM::MulOp::create(b, loc, type, lhs, rhs))
-      .Case("udiv", LLVM::UDivOp::create(b, loc, type, lhs, rhs))
-      .Case("sdiv", LLVM::SDivOp::create(b, loc, type, lhs, rhs))
-      .Case("urem", LLVM::URemOp::create(b, loc, type, lhs, rhs))
-      .Case("srem", LLVM::SRemOp::create(b, loc, type, lhs, rhs))
+  // Note: avoid llvm::StringSwitch with create(...), since that eagerly
+  // builds all candidate ops. Use explicit string comparisons instead.
 
-      // Bitwise
-      .Case("and", LLVM::AndOp::create(b, loc, type, lhs, rhs))
-      .Case("or", LLVM::OrOp::create(b, loc, type, lhs, rhs))
-      .Case("xor", LLVM::XOrOp::create(b, loc, type, lhs, rhs))
-      .Case("shl", LLVM::ShlOp::create(b, loc, type, lhs, rhs))
-      .Case("lshr", LLVM::LShrOp::create(b, loc, type, lhs, rhs))
-      .Case("ashr", LLVM::AShrOp::create(b, loc, type, lhs, rhs))
+  // Integer arithmetic
+  if (opName == "add")
+    return LLVM::AddOp::create(b, loc, type, lhs, rhs);
+  if (opName == "sub")
+    return LLVM::SubOp::create(b, loc, type, lhs, rhs);
+  if (opName == "mul")
+    return LLVM::MulOp::create(b, loc, type, lhs, rhs);
+  if (opName == "udiv")
+    return LLVM::UDivOp::create(b, loc, type, lhs, rhs);
+  if (opName == "sdiv")
+    return LLVM::SDivOp::create(b, loc, type, lhs, rhs);
+  if (opName == "urem")
+    return LLVM::URemOp::create(b, loc, type, lhs, rhs);
+  if (opName == "srem")
+    return LLVM::SRemOp::create(b, loc, type, lhs, rhs);
 
-      // Floating-point arithmetic
-      .Case("fadd", LLVM::FAddOp::create(b, loc, type, lhs, rhs))
-      .Case("fsub", LLVM::FSubOp::create(b, loc, type, lhs, rhs))
-      .Case("fmul", LLVM::FMulOp::create(b, loc, type, lhs, rhs))
-      .Case("fdiv", LLVM::FDivOp::create(b, loc, type, lhs, rhs))
-      .Case("frem", LLVM::FRemOp::create(b, loc, type, lhs, rhs))
+  // Bitwise
+  if (opName == "and")
+    return LLVM::AndOp::create(b, loc, type, lhs, rhs);
+  if (opName == "or")
+    return LLVM::OrOp::create(b, loc, type, lhs, rhs);
+  if (opName == "xor")
+    return LLVM::XOrOp::create(b, loc, type, lhs, rhs);
+  if (opName == "shl")
+    return LLVM::ShlOp::create(b, loc, type, lhs, rhs);
+  if (opName == "lshr")
+    return LLVM::LShrOp::create(b, loc, type, lhs, rhs);
+  if (opName == "ashr")
+    return LLVM::AShrOp::create(b, loc, type, lhs, rhs);
 
-      .Default(Value{});
+  // Floating-point arithmetic
+  if (opName == "fadd")
+    return LLVM::FAddOp::create(b, loc, type, lhs, rhs);
+  if (opName == "fsub")
+    return LLVM::FSubOp::create(b, loc, type, lhs, rhs);
+  if (opName == "fmul")
+    return LLVM::FMulOp::create(b, loc, type, lhs, rhs);
+  if (opName == "fdiv")
+    return LLVM::FDivOp::create(b, loc, type, lhs, rhs);
+  if (opName == "frem")
+    return LLVM::FRemOp::create(b, loc, type, lhs, rhs);
+
+  return Value{};
 }
 
 // create llvm op with vectorized src (unary ops)
 Value createLLVMVecOpUnary(OpBuilder &b, Location loc, StringRef opName,
                            Value operand, Type type) {
-  return llvm::StringSwitch<Value>(opName)
-      .Case("fneg", LLVM::FNegOp::create(b, loc, type, operand))
-      .Case("trunc", LLVM::TruncOp::create(b, loc, type, operand))
-      .Case("zext", LLVM::ZExtOp::create(b, loc, type, operand))
-      .Case("sext", LLVM::SExtOp::create(b, loc, type, operand))
-      .Case("fpext", LLVM::FPExtOp::create(b, loc, type, operand))
-      .Case("fptrunc", LLVM::FPTruncOp::create(b, loc, type, operand))
-      .Case("sitofp", LLVM::SIToFPOp::create(b, loc, type, operand))
-      .Case("uitofp", LLVM::UIToFPOp::create(b, loc, type, operand))
-      .Case("fptosi", LLVM::FPToSIOp::create(b, loc, type, operand))
-      .Case("fptoui", LLVM::FPToUIOp::create(b, loc, type, operand))
-      .Case("bitcast", LLVM::BitcastOp::create(b, loc, type, operand))
-      .Case("ptrtoint", LLVM::PtrToIntOp::create(b, loc, type, operand))
-      .Case("inttoptr", LLVM::IntToPtrOp::create(b, loc, type, operand))
+  // Same reasoning as above: use explicit comparisons to only build
+  // the op we actually need.
 
-      .Default(Value{});
+  if (opName == "fneg")
+    return LLVM::FNegOp::create(b, loc, type, operand);
+  if (opName == "trunc")
+    return LLVM::TruncOp::create(b, loc, type, operand);
+  if (opName == "zext")
+    return LLVM::ZExtOp::create(b, loc, type, operand);
+  if (opName == "sext")
+    return LLVM::SExtOp::create(b, loc, type, operand);
+  if (opName == "fpext")
+    return LLVM::FPExtOp::create(b, loc, type, operand);
+  if (opName == "fptrunc")
+    return LLVM::FPTruncOp::create(b, loc, type, operand);
+  if (opName == "sitofp")
+    return LLVM::SIToFPOp::create(b, loc, type, operand);
+  if (opName == "uitofp")
+    return LLVM::UIToFPOp::create(b, loc, type, operand);
+  if (opName == "fptosi")
+    return LLVM::FPToSIOp::create(b, loc, type, operand);
+  if (opName == "fptoui")
+    return LLVM::FPToUIOp::create(b, loc, type, operand);
+  if (opName == "bitcast")
+    return LLVM::BitcastOp::create(b, loc, type, operand);
+  if (opName == "ptrtoint")
+    return LLVM::PtrToIntOp::create(b, loc, type, operand);
+  if (opName == "inttoptr")
+    return LLVM::IntToPtrOp::create(b, loc, type, operand);
+
+  return Value{};
 }
 
 bool checkPositionSequentialFromZero(SmallVectorImpl<Value> &positions) {
@@ -349,21 +404,32 @@ bool checkPositionSequentialFromZero(SmallVectorImpl<Value> &positions) {
 FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
                                     bool enforce = true) {
   // srcs can be all same, group same, group repeating, all different
-  auto subSize = inferSubVectorSize(values);
+  auto [subSize, isRepeating] = inferSubVectorSize(values);
+  llvm::dbgs() << "try to vectorize from: " << values[0] << "\n";
+  llvm::dbgs() << "sub size: " << subSize << " in " << values.size() << "\n";
   // all same value
   if (subSize == values.size()) {
     Value vecSrc = vectorizeFromScalar(values[0], values.size());
+    llvm::dbgs() << "vector created from scalar: " << vecSrc << "\n";
     return vecSrc;
     // grouped values
   } else if (subSize > 1) {
     SmallVector<SmallVector<Value>> groups;
     groupValuesIntoChunks(values, subSize, groups);
     SmallVector<Value> vecSubVals;
-    for (auto group : groups) {
-      auto subVecVal = tryVectorizeValues(group, enforce);
-      vecSubVals.push_back(*subVecVal);
+    auto firstSubVec = tryVectorizeValues(groups[0], enforce);
+    vecSubVals.push_back(*firstSubVec);
+    for (unsigned i = 1; i < groups.size(); ++i) {
+      if (isRepeating) {
+        vecSubVals.push_back(*firstSubVec);
+        continue;
+      } else {
+        auto subVecVal = tryVectorizeValues(groups[i], enforce);
+        vecSubVals.push_back(*subVecVal);
+      }
     }
     Value vecVals = vectorizeFromSubVector(vecSubVals);
+    llvm::dbgs() << "vector created from subVector: " << vecVals << "\n";
     return vecVals;
   }
   assert(subSize == 1 && "unexpected subSize in vectorization");
@@ -375,13 +441,17 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
   SmallVector<Value> src0;
   SmallVector<Value> src1;
   bool vectorizable = true;
-  for (auto src : values) {
-    auto op = src.getDefiningOp();
+  for (auto val : values) {
+    auto op = val.getDefiningOp();
     if (opName != op->getName()) {
       vectorizable = false;
       break;
+    } else if (isa<LLVM::GEPOp>(op)) {
+      // do not vectorize gep for now
+      vectorizable = false;
+      break;
     } else if (isa<LLVM::ConstantOp>(op)) {
-      src0.push_back(src);
+      src0.push_back(val);
     } else if (auto extract = dyn_cast<LLVM::ExtractElementOp>(op)) {
       src0.push_back(extract.getVector());
       src1.push_back(extract.getPosition());
@@ -405,8 +475,10 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
   // vectorize values
   if (isa<LLVM::ConstantOp>(op)) {
     // use the generic form for now
-    return vectorizeFromScalars(src0);
-  } else if (isa<LLVM::ExtractElementOp>(op)) {
+    Value vecSrc0 = vectorizeFromScalars(src0);
+    llvm::dbgs() << "vector created from scalars: " << vecSrc0 << "\n";
+    return vecSrc0;
+  } else if (isa<LLVM::ExtractElementOp>(op)) { // maybe from vector half(4, 8) is also ok
     bool res = checkPositionSequentialFromZero(src1);
     if (!res)
       return failure();
@@ -427,17 +499,24 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
     auto dstType = VectorType::get(values.size(), op->getResult(0).getType());
     // unary op
     if (!failed(vecSrc0) && src1.empty()) {
-      return createLLVMVecOpUnary(b, loc, name, *vecSrc0, dstType);
+      Value vec = createLLVMVecOpUnary(b, loc, name, *vecSrc0, dstType);
+      llvm::dbgs() << "Created LLVM op: " << vec << "\n";
+      return vec;
     }
     // binary op
     if (!failed(vecSrc0) && !failed(vecSrc1)) {
-      return createLLVMVecOpBinary(b, loc, name, *vecSrc0, *vecSrc1, dstType);
+      Value vec =
+          createLLVMVecOpBinary(b, loc, name, *vecSrc0, *vecSrc1, dstType);
+      llvm::dbgs() << "Created LLVM op: " << vec << "\n";
+      return vec;
     }
     // port attrs
   }
 
-  if (enforce)
+  if (enforce) {
+    llvm::dbgs() << "enforce vectorization fallback to generic\n";
     return vectorizeFromScalars(values);
+  }
   return failure();
 }
 
@@ -459,8 +538,12 @@ getChainOps(LLVM::InsertElementOp insert) {
   return {res, srcs, positions, ops};
 }
 
-LogicalResult tryVectorizeInsertChain(LLVM::InsertElementOp insert) {
+LogicalResult
+tryVectorizeInsertChain(LLVM::InsertElementOp insert,
+                        llvm::SetVector<Operation *> &visitedInsert) {
+  llvm::dbgs() << "check insert chain from : " << insert << "\n";
   auto [dst, srcs, positions, ops] = getChainOps(insert);
+  visitedInsert.insert(ops.begin(), ops.end());
   if (srcs.size() != insert.getVector().getType().getNumElements() ||
       srcs.size() == 1)
     return failure();
@@ -468,12 +551,11 @@ LogicalResult tryVectorizeInsertChain(LLVM::InsertElementOp insert) {
   if (!res)
     return failure();
 
+  llvm::dbgs() << "try to vectorize the insert chain" << "\n";
   FailureOr<Value> vecSrc = tryVectorizeValues(srcs, false);
   if (failed(vecSrc))
     return failure();
   dst.replaceAllUsesWith(*vecSrc);
-  for (auto op : llvm::reverse(ops))
-    op->erase();
   return success();
 }
 
@@ -481,11 +563,17 @@ LogicalResult tryVectorizeInsertChain(LLVM::InsertElementOp insert) {
 
 class TritonLLVMVectorize
     : public impl::TritonLLVMVectorizeBase<TritonLLVMVectorize> {
+private:
+  llvm::SetVector<Operation *> visitedInsert;
+
 public:
   using TritonLLVMVectorizeBase::TritonLLVMVectorizeBase;
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
+
+    // Ensure no stale state if this pass instance is reused.
+    visitedInsert.clear();
 
     // step 1: convert struct type to vector type
     mlir::TypeConverter converter;
@@ -514,16 +602,21 @@ public:
     if (failed(applyPartialConversion(m, target, std::move(patterns))))
       return signalPassFailure();
 
-    // step 2: iteratively vectorize ops
+    // llvm::dbgs() << "Module after struct to vector convert: " << m << "\n";
+
+    // step 2: iteratively vectorize ops from insertelement chains
+    SmallVector<LLVM::InsertElementOp> insertOps;
     auto funcOps = m.getOps<LLVM::LLVMFuncOp>();
     for (auto funcOp : funcOps) {
-      bool changed = false;
-      funcOp.walk<WalkOrder::PreOrder>([&](Operation *op) {
-        if (auto insert = dyn_cast<LLVM::InsertElementOp>(op)) {
-          (void)tryVectorizeInsertChain(insert);
-        }
-      });
+      funcOp.walk<WalkOrder::PreOrder>(
+          [&](LLVM::InsertElementOp op) { insertOps.push_back(op); });
     }
+    for (auto insert : insertOps) {
+      if (!visitedInsert.contains(insert))
+        (void)tryVectorizeInsertChain(insert, visitedInsert);
+    }
+    // step 3: canonicalize after vectorization
+    // step 4: print constant human readable
   }
 };
 } // namespace mlir
