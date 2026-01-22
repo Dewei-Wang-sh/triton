@@ -3,10 +3,12 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/Passes.h"
 
 #include "TritonLLVMTransforms/Passes.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -145,13 +147,13 @@ bool isRepeatingPattern(ArrayRef<Value> values, size_t period) {
 }
 
 // Check if sequence is made of constant blocks of size `blockSize`
-bool isBlockConstantPattern(ArrayRef<Value> values, size_t blockSize) {
-  if (values.size() % blockSize != 0)
+bool isGroupConstantPattern(ArrayRef<Value> values, size_t groupSize) {
+  if (values.size() % groupSize != 0)
     return false;
-  size_t numBlocks = values.size() / blockSize;
-  for (size_t b = 0; b < numBlocks; ++b) {
-    ArrayRef<Value> block = values.slice(b * blockSize, blockSize);
-    if (!allEqual(block))
+  size_t numGroups = values.size() / groupSize;
+  for (size_t b = 0; b < numGroups; ++b) {
+    ArrayRef<Value> group = values.slice(b * groupSize, groupSize);
+    if (!allEqual(group))
       return false;
   }
   return true;
@@ -167,8 +169,8 @@ std::pair<size_t, bool> inferSubVectorSize(ArrayRef<Value> values) {
   int logN = llvm::Log2_64(N);
   for (int i = logN; i >= 1; --i) {
     size_t subSize = size_t{1} << i;
-    // Block-constant works for any size (including full vector)
-    if (isBlockConstantPattern(values, subSize)) {
+    // Group-constant works for any size (including full vector)
+    if (isGroupConstantPattern(values, subSize)) {
       return {subSize, false};
     }
   }
@@ -198,16 +200,14 @@ bool groupValuesIntoChunks(ArrayRef<Value> values, size_t subSize,
   return true;
 }
 
-Value vectorizeFromScalar(Value scalar, int64_t numElements) {
-  auto op = scalar.getDefiningOp();
-  OpBuilder b(op);
-  b.setInsertionPointAfter(op);
-  Location loc = op->getLoc();
+Value vectorizeFromScalar(Value scalar, int64_t numElements, Operation *srcOp) {
+  OpBuilder b(srcOp);
+  Location loc = srcOp->getLoc();
   auto scalarTy = scalar.getType();
   auto vecTy = VectorType::get(numElements, scalarTy);
 
   /// vectorize scalar constant
-  if (auto cst = dyn_cast<LLVM::ConstantOp>(op)) {
+  if (auto cst = dyn_cast<LLVM::ConstantOp>(scalar.getDefiningOp())) {
     if (scalarTy.isFloat()) {
       APFloat cstVal(0.0);
       (void)matchPattern(scalar, m_ConstantFloat(&cstVal));
@@ -241,14 +241,14 @@ Value vectorizeFromScalar(Value scalar, int64_t numElements) {
   return LLVM::ShuffleVectorOp::create(b, loc, vecTy, inserted, undef, mask);
 }
 
-Value vectorizeFromSubVector(SmallVector<Value> subVectors) {
+Value vectorizeFromSubVector(SmallVector<Value> subVectors, Operation *srcOp) {
   assert(!subVectors.empty() && "No sub-vectors provided");
+  if (subVectors.size() == 1)
+    return subVectors[0];
   assert(llvm::isPowerOf2_64(subVectors.size()) &&
          "Number of sub-vectors must be power of two");
-  auto op = subVectors.back().getDefiningOp();
-  OpBuilder b(op);
-  b.setInsertionPointAfter(op);
-  Location loc = op->getLoc();
+  OpBuilder b(srcOp);
+  Location loc = srcOp->getLoc();
 
   // Work on a mutable list
   SmallVector<Value> current = subVectors;
@@ -284,13 +284,10 @@ Value vectorizeFromSubVector(SmallVector<Value> subVectors) {
 }
 
 // generic vectorize
-Value vectorizeFromScalars(SmallVectorImpl<Value> &scalars) {
-  auto op = scalars.back().getDefiningOp();
-  OpBuilder b(op);
-  b.setInsertionPointAfter(op);
-  auto loc = op->getLoc();
+Value vectorizeFromScalars(SmallVectorImpl<Value> &scalars, Operation *srcOp) {
+  OpBuilder b(srcOp);
+  auto loc = srcOp->getLoc();
   auto vecType = VectorType::get(scalars.size(), scalars[0].getType());
-
   Value vector = LLVM::UndefOp::create(b, loc, vecType);
   for (size_t i = 0; i < scalars.size(); ++i) {
     auto idx = LLVM::ConstantOp::create(
@@ -389,27 +386,30 @@ Value createLLVMVecOpUnary(OpBuilder &b, Location loc, StringRef opName,
   return Value{};
 }
 
-bool checkPositionSequentialFromZero(SmallVectorImpl<Value> &positions) {
-  SmallVector<int32_t> pos;
+std::tuple<bool, SmallVector<APInt>, SmallVector<int32_t>>
+checkPositionSequentialFromZero(SmallVectorImpl<Value> &positions) {
+  SmallVector<int32_t> cst;
+  SmallVector<APInt> pos;
   for (auto p : positions) {
     APInt cstVal;
     if (!matchPattern(p, m_ConstantInt(&cstVal))) {
-      return false;
+      return {false, {}, {}};
     }
-    pos.push_back(cstVal.getSExtValue());
+    pos.push_back(cstVal);
+    cst.push_back(cstVal.getSExtValue());
   }
-  return llvm::equal(pos, llvm::seq<int32_t>(pos.size()));
+  return {llvm::equal(cst, llvm::seq<int32_t>(cst.size())), pos, cst};
 }
 
 FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
-                                    bool enforce = true) {
+                                    Operation *srcOp, bool enforce = true) {
   // srcs can be all same, group same, group repeating, all different
   auto [subSize, isRepeating] = inferSubVectorSize(values);
   llvm::dbgs() << "try to vectorize from: " << values[0] << "\n";
   llvm::dbgs() << "sub size: " << subSize << " in " << values.size() << "\n";
   // all same value
   if (subSize == values.size()) {
-    Value vecSrc = vectorizeFromScalar(values[0], values.size());
+    Value vecSrc = vectorizeFromScalar(values[0], values.size(), srcOp);
     llvm::dbgs() << "vector created from scalar: " << vecSrc << "\n";
     return vecSrc;
     // grouped values
@@ -417,18 +417,18 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
     SmallVector<SmallVector<Value>> groups;
     groupValuesIntoChunks(values, subSize, groups);
     SmallVector<Value> vecSubVals;
-    auto firstSubVec = tryVectorizeValues(groups[0], enforce);
+    auto firstSubVec = tryVectorizeValues(groups[0], srcOp, enforce);
     vecSubVals.push_back(*firstSubVec);
     for (unsigned i = 1; i < groups.size(); ++i) {
       if (isRepeating) {
         vecSubVals.push_back(*firstSubVec);
         continue;
       } else {
-        auto subVecVal = tryVectorizeValues(groups[i], enforce);
+        auto subVecVal = tryVectorizeValues(groups[i], srcOp, enforce);
         vecSubVals.push_back(*subVecVal);
       }
     }
-    Value vecVals = vectorizeFromSubVector(vecSubVals);
+    Value vecVals = vectorizeFromSubVector(vecSubVals, srcOp);
     llvm::dbgs() << "vector created from subVector: " << vecVals << "\n";
     return vecVals;
   }
@@ -441,17 +441,26 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
   SmallVector<Value> src0;
   SmallVector<Value> src1;
   bool vectorizable = true;
+  // SmallVector<Attribute> gepCstIndices;
   for (auto val : values) {
     auto op = val.getDefiningOp();
     if (opName != op->getName()) {
       vectorizable = false;
       break;
-    } else if (isa<LLVM::GEPOp>(op)) {
-      // do not vectorize gep for now
-      vectorizable = false;
-      break;
     } else if (isa<LLVM::ConstantOp>(op)) {
       src0.push_back(val);
+    } else if (auto gep = dyn_cast<LLVM::GEPOp>(op)) {
+      // skip it for now
+      vectorizable = false;
+      break;
+      // src0.push_back(gep.getBase());
+      // assert(gep.getIndices().size() == 1 &&
+      //        "only support single index gep in vectorization");
+      // auto idx = gep.getIndices().front();
+      // if (isa<IntegerAttr>(idx))
+      //   gepCstIndices.push_back(idx);
+      // else
+      //   src1.push_back(idx);
     } else if (auto extract = dyn_cast<LLVM::ExtractElementOp>(op)) {
       src0.push_back(extract.getVector());
       src1.push_back(extract.getPosition());
@@ -471,30 +480,81 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
   if (!enforce && !vectorizable)
     return failure();
 
-  OpBuilder b(op);
+  OpBuilder b(srcOp);
+  auto loc = srcOp->getLoc();
   // vectorize values
   if (isa<LLVM::ConstantOp>(op)) {
-    // use the generic form for now
-    Value vecSrc0 = vectorizeFromScalars(src0);
-    llvm::dbgs() << "vector created from scalars: " << vecSrc0 << "\n";
-    return vecSrc0;
-  } else if (isa<LLVM::ExtractElementOp>(op)) { // maybe from vector half(4, 8) is also ok
-    bool res = checkPositionSequentialFromZero(src1);
-    if (!res)
+    auto [res, pos, cst] = checkPositionSequentialFromZero(src0);
+    auto vecTy = VectorType::get(src0.size(), src0[0].getType());
+    auto dense = DenseElementsAttr::get(vecTy, llvm::ArrayRef(pos));
+    Value cstVec = LLVM::ConstantOp::create(b, loc, vecTy, dense);
+    llvm::dbgs() << "vectorized constant: " << cstVec << "\n";
+    return cstVec;
+  } else if (auto gep = dyn_cast<LLVM::GEPOp>(op)) {
+    // auto [subSize, isRepeating] = inferSubVectorSize(src0);
+    // Value vecBase = vectorizeFromScalar(src0[0], src0.size(), op);
+    // Value vecIdx;
+    // // indices can be dynamic value or static constant
+    // if (!gepCstIndices.empty()) {
+    //   assert(gepCstIndices.size() == src0.size() &&
+    //          "all gep indices should be constant in vectorization");
+    //   vecIdx = LLVM::ConstantOp::create(b, loc,
+    //                                  VectorType::get(src0.size(),
+    //                                  b.getI32Type()), DenseElementsAttr::get(
+    //                                      VectorType::get(src0.size(),
+    //                                      b.getI32Type()), gepCstIndices));
+    // } else {
+    //   assert(src1.size() == src0.size() &&
+    //          "all gep indices should be collected in vectorization");
+    //   vecIdx = tryVectorizeValues(src1, );
+    // }
+    // Value vecGep = LLVM::GEPOp::create(b, loc, vecBase.getType(),
+    //                                    gep.getElemType() vecBase, vecIdx);
+    // llvm::dbgs() << "vectorized gep: " << vecGep << "\n";
+    // return vecGep;
+  } else if (isa<LLVM::ExtractElementOp>(op)) {
+    auto [subSize, isRepeating] = inferSubVectorSize(src0);
+    // make sure it's group constant
+    if (subSize == 1 || isRepeating)
       return failure();
-    llvm::SetVector<Value> uniqueSrc0(src0.begin(), src0.end());
-    assert(uniqueSrc0.size() == 1 &&
-           "only support all same vector in vectorization");
-    return src0[0];
+    SmallVector<SmallVector<Value>> vectorGroups;
+    SmallVector<SmallVector<Value>> positionGroups;
+    groupValuesIntoChunks(src0, subSize, vectorGroups);
+    groupValuesIntoChunks(src1, subSize, positionGroups);
+    SmallVector<Value> vecSubVals;
+    for (unsigned i = 0; i < vectorGroups.size(); ++i) {
+      auto vecGroup = vectorGroups[i];
+      auto posGroup = positionGroups[i];
+      auto [res, pos, cst] = checkPositionSequentialFromZero(posGroup);
+      auto srcVecTy = cast<VectorType>(vecGroup[0].getType());
+      auto dstVecTy =
+          VectorType::get(vecGroup.size(), srcVecTy.getElementType());
+      // full match
+      if (res && srcVecTy == dstVecTy) {
+        vecSubVals.push_back(vecGroup[0]);
+        // partial match
+      } else {
+        assert(cst.size() == vecGroup.size() && "not all constant");
+        Value subVal = LLVM::ShuffleVectorOp::create(
+            b, loc, dstVecTy, vecGroup[0], vecGroup[0], cst);
+        vecSubVals.push_back(subVal);
+      }
+    }
+    Value vecVals = vectorizeFromSubVector(vecSubVals, srcOp);
+    llvm::dbgs() << "vector created from subVector: " << vecVals << "\n";
+    return vecVals;
+    // llvm::SetVector<Value> uniqueSrc0(src0.begin(), src0.end());
+    // assert(uniqueSrc0.size() == 1 &&
+    //        "only support all same vector in vectorization");
+    // return src0[0];
   } else {
     FailureOr<Value> vecSrc0;
     FailureOr<Value> vecSrc1;
     if (!src0.empty())
-      vecSrc0 = tryVectorizeValues(src0);
+      vecSrc0 = tryVectorizeValues(src0, op);
     if (!src1.empty())
-      vecSrc1 = tryVectorizeValues(src1);
+      vecSrc1 = tryVectorizeValues(src1, op);
 
-    auto loc = op->getLoc();
     auto name = opName.stripDialect().str();
     auto dstType = VectorType::get(values.size(), op->getResult(0).getType());
     // unary op
@@ -515,7 +575,7 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
 
   if (enforce) {
     llvm::dbgs() << "enforce vectorization fallback to generic\n";
-    return vectorizeFromScalars(values);
+    return vectorizeFromScalars(values, srcOp);
   }
   return failure();
 }
@@ -547,14 +607,18 @@ tryVectorizeInsertChain(LLVM::InsertElementOp insert,
   if (srcs.size() != insert.getVector().getType().getNumElements() ||
       srcs.size() == 1)
     return failure();
-  bool res = checkPositionSequentialFromZero(positions);
+  bool res = std::get<0>(checkPositionSequentialFromZero(positions));
   if (!res)
     return failure();
 
   llvm::dbgs() << "try to vectorize the insert chain" << "\n";
-  FailureOr<Value> vecSrc = tryVectorizeValues(srcs, false);
-  if (failed(vecSrc))
+  FailureOr<Value> vecSrc = tryVectorizeValues(srcs, insert, false);
+  if (failed(vecSrc)) {
+    llvm::dbgs() << "====================" << "\n";
+    llvm::dbgs() << "potential but failed" << "\n";
+    llvm::dbgs() << "====================" << "\n";
     return failure();
+  }
   dst.replaceAllUsesWith(*vecSrc);
   return success();
 }
@@ -616,6 +680,10 @@ public:
         (void)tryVectorizeInsertChain(insert, visitedInsert);
     }
     // step 3: canonicalize after vectorization
+    OpPassManager pm;
+    pm.addPass(mlir::createCanonicalizerPass());
+    if (failed(runPipeline(pm, m)))
+      return signalPassFailure();
     // step 4: print constant human readable
   }
 };
