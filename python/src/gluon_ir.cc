@@ -637,7 +637,7 @@ void init_gluon_ir(py::module &&m) {
       .def("create_async_wait_group",
            [](GluonOpBuilder &self, int num) {
              ValueRange tokens;
-             self.create<ttg::AsyncWaitOp>(tokens, num);
+             self.create<ttag::AsyncWaitOp>(tokens, num);
            })
       .def("create_convert_layout",
            [](GluonOpBuilder &self, Type resultTy, Value value) -> Value {
