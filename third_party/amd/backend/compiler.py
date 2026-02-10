@@ -513,6 +513,11 @@ class HIPBackend(BaseBackend):
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
+        if os.getenv("FROM_MY"):
+            with open("/home/dewwang/.triton/cache/my.amdgcn", "r") as file:
+                content = file.readlines()
+            amdgcn = ''.join(content)
+
         return amdgcn
 
     @staticmethod

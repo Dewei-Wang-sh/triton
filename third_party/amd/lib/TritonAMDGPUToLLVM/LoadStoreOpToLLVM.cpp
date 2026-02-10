@@ -753,10 +753,10 @@ struct BufferLoadToLocalOpConversion
     // If the op has a contiguity hint use it to increase the vector size.
     vec = std::max(vec, op.getContiguity());
 
-    if (!LLVM::AMD::canLoadDirectToLDS(targetInfo, ptrType, dstEnc,
-                                       dstTy.getAllocShape(), vec)) {
-      return failure();
-    }
+    //if (!LLVM::AMD::canLoadDirectToLDS(targetInfo, ptrType, dstEnc,
+    //                                   dstTy.getAllocShape(), vec)) {
+    //  return failure();
+    //}
 
     // For swizzled layouts we need to use the non swizzled layout to compute
     // the LDS addresses since we gather into LDS
@@ -767,6 +767,8 @@ struct BufferLoadToLocalOpConversion
     bool requiresSrcPtrSwizzling =
         !targetInfo.supportsDirectToLDSScattering() && maybeSwizzledEnc &&
         maybeSwizzledEnc.getMaxPhase() != 1;
+    if (isa<LinearEncodingAttr>(ptrType.getEncoding()))
+      requiresSrcPtrSwizzling = false;
     if (requiresSrcPtrSwizzling) {
       // TODO (alex): this is only correct as long as the lds view is a
       // contiguous block. So this can break if we slice along the 2 minor
