@@ -753,10 +753,10 @@ struct BufferLoadToLocalOpConversion
     // If the op has a contiguity hint use it to increase the vector size.
     vec = std::max(vec, op.getContiguity());
 
-    //if (!LLVM::AMD::canLoadDirectToLDS(targetInfo, ptrType, dstEnc,
-    //                                   dstTy.getAllocShape(), vec)) {
-    //  return failure();
-    //}
+    // if (!LLVM::AMD::canLoadDirectToLDS(targetInfo, ptrType, dstEnc,
+    //                                    dstTy.getAllocShape(), vec)) {
+    //   return failure();
+    // }
 
     // For swizzled layouts we need to use the non swizzled layout to compute
     // the LDS addresses since we gather into LDS
@@ -829,6 +829,8 @@ struct BufferLoadToLocalOpConversion
           hasOther ? b.true_val() : maybeSwizzledMaskElem, op.getCache());
       if (targetInfo.requiresAliasInfoForAsyncOps())
         AMD::addAsyncCopyAliasScope(bufferLoadToLds);
+      // Merge shared memory alias scope from allocation analysis
+      targetInfo.annotateSharedMemoryAlias(bufferLoadToLds, op);
 
       if (hasOther) {
         emitOtherStore(rewriter, loc, this->getTypeConverter(), vecTy, maskElem,
@@ -965,9 +967,9 @@ struct AsyncCopyGlobalToLocalOpConversion
         Value outOfRangeAddress =
             b.inttoptr(shmemAddr.getType(), b.i32_val(0x7FFFFFFF));
         Value predicatedAddress = b.select(cond, shmemAddr, outOfRangeAddress);
-
         emitAsyncLoad(rewriter, loc, targetInfo, vecBits, srcElem,
-                      predicatedAddress, op.getCache(), multicastMask);
+                      predicatedAddress, op.getCache(), multicastMask,
+                      op.getOperation());
       } else {
         // For architectures not supporting per lane LDS addresses we need to
         // emit a branch
@@ -1006,7 +1008,8 @@ struct AsyncCopyGlobalToLocalOpConversion
   void emitAsyncLoad(RewriterBase &rewriter, Location loc,
                      AMD::TargetInfo targetInfo, int vecBits, Value srcPtr,
                      Value shmemAddr, triton::CacheModifier cacheMod,
-                     Value multicastMask) const {
+                     Value multicastMask,
+                     Operation *aliasScopeSourceOp = nullptr) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     int32_t cacheModifiers =
         mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
@@ -1019,6 +1022,10 @@ struct AsyncCopyGlobalToLocalOpConversion
           /*offset=*/0, cacheModifiers, nullptr, nullptr, nullptr);
       if (targetInfo.requiresAliasInfoForAsyncOps())
         AMD::addAsyncCopyAliasScope(globalLoadLdsOp);
+      // Merge shared memory alias scope from allocation analysis
+      if (aliasScopeSourceOp)
+        targetInfo.annotateSharedMemoryAlias(globalLoadLdsOp,
+                                             aliasScopeSourceOp);
     } else if (targetInfo.getISAFamily() == ISAFamily::GFX1250) {
       if (cacheMod != triton::CacheModifier::NONE) {
         emitRemark(loc) << "cache modifiers not yet implemented on gfx1250";
