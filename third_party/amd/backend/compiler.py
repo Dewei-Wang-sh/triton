@@ -662,6 +662,10 @@ class HIPBackend(BaseBackend):
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
         kernel_fn.add_fn_attr("denormal-fp-math-f32", denormal_mode)
 
+        # Workaround, remove once the LLVM fix lands
+        # With this set, waves_per_eu >= 2 uses no AGPRs; waves_per_eu = 1 still gets 256.
+        kernel_fn.add_fn_attr("amdgpu-agpr-alloc", "0")
+
         if knobs.compilation.enable_asan:
             kernel_fn.add_fn_target_feature("+xnack")
             kernel_fn.add_fn_asan_attr()
@@ -796,6 +800,18 @@ class HIPBackend(BaseBackend):
                 dump_ir=knobs.getenv_bool("LLVM_IR_ENABLE_DUMP", False),
                 enable_timing=knobs.getenv_bool("LLVM_ENABLE_TIMING", False),
             )
+        # Hand-edited assembly injection. AMD_INSERT_AMDGCN=<file.amdgcn> replaces the
+        # generated assembly for the one kernel that file defines; any other kernel
+        # compiled in the same process keeps its own codegen.
+        insert_module_path = os.environ.get("AMD_INSERT_AMDGCN")
+        if insert_module_path:
+            if not os.path.exists(insert_module_path):
+                raise RuntimeError(f'cannot find amdgcn file to insert. Given: `{insert_module_path}`')
+            with open(insert_module_path, "r") as file:
+                file_content = file.read()
+            if f'.amdhsa_kernel {names[0]}' in file_content:
+                print(f'[AMD_INSERT_AMDGCN] {names[0]} <- {insert_module_path}')
+                amdgcn = file_content
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
             print(amdgcn)
