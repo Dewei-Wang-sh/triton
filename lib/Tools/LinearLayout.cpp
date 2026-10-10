@@ -1214,13 +1214,7 @@ LinearLayout LinearLayout::removeZeroBasesAlongDim(StringAttr stripDim) const {
       }
     }
   }
-  SmallVector<std::pair<StringAttr, int32_t>> newOutDimSizes;
-  for (auto outDim : getOutDimNames()) {
-    newOutDimSizes.push_back({outDim, getOutDimSize(outDim)});
-  }
-  auto newLayout = LinearLayout(std::move(result), ArrayRef(newOutDimSizes),
-                                this->isSurjective());
-  return newLayout;
+  return LinearLayout(std::move(result), getOutDims(), isSurjective());
 }
 
 size_t hash_value(const LinearLayout &layout) {
