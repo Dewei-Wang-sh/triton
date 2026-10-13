@@ -2,6 +2,7 @@
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 -cse | FileCheck %s --check-prefix=GFX942
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 -cse | FileCheck %s --check-prefix=GFX950
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 -cse | FileCheck %s --check-prefix=GFX1250
+// RUN: triton-opt %s -split-input-file --tritonllvm-vectorize | FileCheck %s --check-prefix=LLVM-VECTORIZE
 
 #blocked_reduce = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
@@ -113,5 +114,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
       tt.reduce.return %min : f32
     }) : (tensor<1x128xf32, #blocked_reduce>) -> tensor<1xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
     tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // Check the standalone port before extending its operation coverage.
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_llvm_integer_add
+  // LLVM-VECTORIZE-NEXT: %[[SUM:.*]] = llvm.add %arg0, %arg1 : vector<2xi32>
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[SUM]] : vector<2xi32>
+  llvm.func @vectorize_llvm_integer_add(%a: vector<2xi32>, %b: vector<2xi32>) -> vector<2xi32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %a0 = llvm.extractelement %a[%c0 : i32] : vector<2xi32>
+    %a1 = llvm.extractelement %a[%c1 : i32] : vector<2xi32>
+    %b0 = llvm.extractelement %b[%c0 : i32] : vector<2xi32>
+    %b1 = llvm.extractelement %b[%c1 : i32] : vector<2xi32>
+    %x0 = llvm.add %a0, %b0 : i32
+    %x1 = llvm.add %a1, %b1 : i32
+    %s = llvm.mlir.undef : !llvm.struct<(i32, i32)>
+    %s0 = llvm.insertvalue %x0, %s[0] : !llvm.struct<(i32, i32)>
+    %s1 = llvm.insertvalue %x1, %s0[1] : !llvm.struct<(i32, i32)>
+    %r0 = llvm.extractvalue %s1[0] : !llvm.struct<(i32, i32)>
+    %r1 = llvm.extractvalue %s1[1] : !llvm.struct<(i32, i32)>
+    %u = llvm.mlir.undef : vector<2xi32>
+    %v0 = llvm.insertelement %r0, %u[%c0 : i32] : vector<2xi32>
+    %v1 = llvm.insertelement %r1, %v0[%c1 : i32] : vector<2xi32>
+    llvm.return %v1 : vector<2xi32>
   }
 }
