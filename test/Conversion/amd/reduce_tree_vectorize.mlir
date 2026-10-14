@@ -370,3 +370,103 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
   // }
 
 }
+
+// -----
+
+// LLVM-VECTORIZE: #[[$LOOP:.*]] = #llvm.loop_annotation<disableNonforced = false, mustProgress = true>
+#loop = #llvm.loop_annotation<disableNonforced = false, mustProgress = true>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // A merge reached by both br and cond_br must receive vectors on both edges.
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_mixed_predecessors
+  // LLVM-VECTORIZE: llvm.cond_br %arg0, ^{{.*}}, ^[[MERGE:bb[0-9]+]]({{.*}} : vector<1xf32>)
+  // LLVM-VECTORIZE: llvm.br ^[[MERGE]]({{.*}} : vector<1xf32>)
+  // LLVM-VECTORIZE: ^[[MERGE]](%[[MERGED:.*]]: vector<1xf32>):
+  // LLVM-VECTORIZE: llvm.extractelement %[[MERGED]][{{.*}}] : vector<1xf32>
+  llvm.func @vectorize_mixed_predecessors(%condition: i1, %x: f32, %y: f32) -> f32 {
+    %u = llvm.mlir.undef : !llvm.struct<(f32)>
+    %initial = llvm.insertvalue %x, %u[0] : !llvm.struct<(f32)>
+    llvm.br ^header(%initial : !llvm.struct<(f32)>)
+  ^header(%carried: !llvm.struct<(f32)>):
+    llvm.cond_br %condition, ^other, ^merge(%carried : !llvm.struct<(f32)>)
+  ^other:
+    %alternate = llvm.insertvalue %y, %u[0] : !llvm.struct<(f32)>
+    llvm.br ^merge(%alternate : !llvm.struct<(f32)>)
+  ^merge(%merged: !llvm.struct<(f32)>):
+    %result = llvm.extractvalue %merged[0] : !llvm.struct<(f32)>
+    llvm.return %result : f32
+  }
+
+  // Convert both conditional destinations, keep scalar arguments, and preserve
+  // branch weights and the loop annotation on the unconditional backedge.
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_tuple_loop
+  // LLVM-VECTORIZE: llvm.br ^[[HEADER:bb[0-9]+]]({{.*}} : vector<1xf32>, i32)
+  // LLVM-VECTORIZE: ^[[HEADER]](%[[CARRIED:.*]]: vector<1xf32>, %[[ITER:.*]]: i32):
+  // LLVM-VECTORIZE: llvm.cond_br %{{.*}} weights([9, 1]), ^[[BODY:bb[0-9]+]](%[[CARRIED]], %[[ITER]] : vector<1xf32>, i32), ^[[EXIT:bb[0-9]+]](%[[CARRIED]] : vector<1xf32>)
+  // LLVM-VECTORIZE: ^[[BODY]](%[[VALUE:.*]]: vector<1xf32>, %{{.*}}: i32):
+  // LLVM-VECTORIZE: llvm.extractelement %[[VALUE]][{{.*}}] : vector<1xf32>
+  // LLVM-VECTORIZE: llvm.br ^[[HEADER]]({{.*}} : vector<1xf32>, i32) {loop_annotation = #[[$LOOP]]}
+  // LLVM-VECTORIZE: ^[[EXIT]](%[[RESULT:.*]]: vector<1xf32>):
+  // LLVM-VECTORIZE: llvm.extractelement %[[RESULT]][{{.*}}] : vector<1xf32>
+  llvm.func @vectorize_tuple_loop(%x: f32, %count: i32) -> f32 {
+    %zero = llvm.mlir.constant(0 : i32) : i32
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %u = llvm.mlir.undef : !llvm.struct<(f32)>
+    %initial = llvm.insertvalue %x, %u[0] : !llvm.struct<(f32)>
+    llvm.br ^header(%initial, %zero : !llvm.struct<(f32)>, i32)
+  ^header(%carried: !llvm.struct<(f32)>, %iteration: i32):
+    %continue = llvm.icmp "slt" %iteration, %count : i32
+    llvm.cond_br %continue weights([9, 1]), ^body(%carried, %iteration : !llvm.struct<(f32)>, i32), ^exit(%carried : !llvm.struct<(f32)>)
+  ^body(%value: !llvm.struct<(f32)>, %i: i32):
+    %scalar = llvm.extractvalue %value[0] : !llvm.struct<(f32)>
+    %sum = llvm.fadd %scalar, %x : f32
+    %next = llvm.insertvalue %sum, %u[0] : !llvm.struct<(f32)>
+    %next_i = llvm.add %i, %one : i32
+    llvm.br ^header(%next, %next_i : !llvm.struct<(f32)>, i32) {loop_annotation = #loop}
+  ^exit(%result: !llvm.struct<(f32)>):
+    %scalar_result = llvm.extractvalue %result[0] : !llvm.struct<(f32)>
+    llvm.return %scalar_result : f32
+  }
+
+  // A conditional backedge uses a signature already converted by the entry br.
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_conditional_backedge
+  // LLVM-VECTORIZE: llvm.br ^[[HEADER:bb[0-9]+]]({{.*}} : vector<1xf32>, i32)
+  // LLVM-VECTORIZE: ^[[HEADER]](%{{.*}}: vector<1xf32>, %{{.*}}: i32):
+  // LLVM-VECTORIZE: llvm.cond_br %{{.*}} weights([7, 1]), ^[[HEADER]](%[[NEXT:.*]], %{{.*}} : vector<1xf32>, i32), ^[[EXIT:bb[0-9]+]](%[[NEXT]] : vector<1xf32>) {loop_annotation = #[[$LOOP]]}
+  // LLVM-VECTORIZE: ^[[EXIT]](%[[RESULT:.*]]: vector<1xf32>):
+  // LLVM-VECTORIZE: llvm.extractelement %[[RESULT]][{{.*}}] : vector<1xf32>
+  llvm.func @vectorize_conditional_backedge(%x: f32, %count: i32) -> f32 {
+    %zero = llvm.mlir.constant(0 : i32) : i32
+    %one = llvm.mlir.constant(1 : i32) : i32
+    %u = llvm.mlir.undef : !llvm.struct<(f32)>
+    %initial = llvm.insertvalue %x, %u[0] : !llvm.struct<(f32)>
+    llvm.br ^header(%initial, %zero : !llvm.struct<(f32)>, i32)
+  ^header(%carried: !llvm.struct<(f32)>, %iteration: i32):
+    %scalar = llvm.extractvalue %carried[0] : !llvm.struct<(f32)>
+    %sum = llvm.fadd %scalar, %x : f32
+    %next = llvm.insertvalue %sum, %u[0] : !llvm.struct<(f32)>
+    %next_i = llvm.add %iteration, %one : i32
+    %continue = llvm.icmp "slt" %next_i, %count : i32
+    llvm.cond_br %continue weights([7, 1]), ^header(%next, %next_i : !llvm.struct<(f32)>, i32), ^exit(%next : !llvm.struct<(f32)>) {loop_annotation = #loop}
+  ^exit(%result: !llvm.struct<(f32)>):
+    %scalar_result = llvm.extractvalue %result[0] : !llvm.struct<(f32)>
+    llvm.return %scalar_result : f32
+  }
+
+  // Both edges target the same block but forward different values. Convert its
+  // signature once and retain the correct operand list for each edge.
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_shared_successor
+  // LLVM-VECTORIZE: %[[TRUE:.*]] = llvm.insertelement %arg1, {{.*}} : vector<1xf32>
+  // LLVM-VECTORIZE: %[[FALSE:.*]] = llvm.insertelement %arg2, {{.*}} : vector<1xf32>
+  // LLVM-VECTORIZE: llvm.cond_br %arg0 weights([3, 2]), ^[[MERGE:bb[0-9]+]](%[[TRUE]] : vector<1xf32>), ^[[MERGE]](%[[FALSE]] : vector<1xf32>)
+  // LLVM-VECTORIZE: ^[[MERGE]](%[[MERGED:.*]]: vector<1xf32>):
+  // LLVM-VECTORIZE: llvm.extractelement %[[MERGED]][{{.*}}] : vector<1xf32>
+  llvm.func @vectorize_shared_successor(%condition: i1, %x: f32, %y: f32) -> f32 {
+    %u = llvm.mlir.undef : !llvm.struct<(f32)>
+    %true_value = llvm.insertvalue %x, %u[0] : !llvm.struct<(f32)>
+    %false_value = llvm.insertvalue %y, %u[0] : !llvm.struct<(f32)>
+    llvm.cond_br %condition weights([3, 2]), ^merge(%true_value : !llvm.struct<(f32)>), ^merge(%false_value : !llvm.struct<(f32)>)
+  ^merge(%merged: !llvm.struct<(f32)>):
+    %result = llvm.extractvalue %merged[0] : !llvm.struct<(f32)>
+    llvm.return %result : f32
+  }
+}

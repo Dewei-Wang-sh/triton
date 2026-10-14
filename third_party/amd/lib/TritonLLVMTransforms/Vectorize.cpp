@@ -147,40 +147,31 @@ public:
   }
 };
 
-class ConvertBranch : public OpConversionPattern<LLVM::BrOp> {
+template <typename BranchOp>
+class ConvertBranch : public OpConversionPattern<BranchOp> {
 public:
-  using OpConversionPattern::OpConversionPattern;
+  using OpConversionPattern<BranchOp>::OpConversionPattern;
   LogicalResult
-  matchAndRewrite(LLVM::BrOp op, OpAdaptor adaptor,
+  matchAndRewrite(BranchOp op, typename BranchOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    bool needsConversion = false;
-    for (auto operand : op.getDestOperands()) {
-      Type newTy = getTypeConverter()->convertType(operand.getType());
-      if (newTy != operand.getType()) {
-        needsConversion = true;
-        break;
-      }
+    const TypeConverter *converter = this->getTypeConverter();
+    for (unsigned i = 0; i < op->getNumSuccessors(); ++i) {
+      // Signature conversion redirects all incoming edges. Read successors
+      // from the op again so shared destinations and backedges are converted
+      // only once, including when both cond_br edges target the same block.
+      Block *successor = op->getSuccessor(i);
+      if (converter->isLegal(successor->getArgumentTypes()))
+        continue;
+      auto signature = converter->convertBlockSignature(successor);
+      if (!signature)
+        return rewriter.notifyMatchFailure(op, "cannot convert block arguments");
+      rewriter.applySignatureConversion(successor, *signature, converter);
     }
 
-    if (needsConversion) {
-      Block *successor = op.getSuccessor();
-
-      // Convert successor block argument types
-      TypeConverter::SignatureConversion sigConversion(
-          successor->getNumArguments());
-      for (unsigned i = 0, e = successor->getNumArguments(); i < e; ++i) {
-        Type newType = getTypeConverter()->convertType(
-            successor->getArgument(i).getType());
-        sigConversion.addInputs(i, newType);
-      }
-      auto newSuccessor =
-          rewriter.applySignatureConversion(successor, sigConversion);
-
-      rewriter.replaceOpWithNewOp<LLVM::BrOp>(op, adaptor.getDestOperands(),
-                                              newSuccessor);
-      return success();
-    }
-    return failure();
+    // Tuple-to-vector conversion is 1:1, so operand segments stay unchanged.
+    // Updating in place also preserves branch weights and loop annotations.
+    rewriter.modifyOpInPlace(op, [&] { op->setOperands(adaptor.getOperands()); });
+    return success();
   }
 };
 
@@ -741,12 +732,13 @@ public:
           return isIntrinsicResultExtraction(op) ||
                  converter.isLegal(op.getContainer().getType());
         });
-    target.addDynamicallyLegalOp<LLVM::BrOp>(
+    target.addDynamicallyLegalOp<LLVM::BrOp, LLVM::CondBrOp>(
         [&](Operation *op) { return converter.isLegal(op); });
 
     RewritePatternSet patterns(context);
     patterns.add<ConvertUndef, ConvertInsertValue, ConvertExtractValue,
-                 ConvertBranch>(converter, context);
+                 ConvertBranch<LLVM::BrOp>, ConvertBranch<LLVM::CondBrOp>>(
+        converter, context);
 
     if (failed(applyPartialConversion(m, target, std::move(patterns))))
       return signalPassFailure();
