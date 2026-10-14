@@ -609,3 +609,178 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     llvm.return %v1 : vector<2xf32>
   }
 }
+
+// -----
+
+// Reconstruct masking between an existing MFMA vector and a local reduction.
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_mfma_masked_reduce
+  // LLVM-VECTORIZE-NOT: llvm.extractelement
+  // LLVM-VECTORIZE: %[[DOT:.*]] = rocdl.mfma.f32.16x16x32.bf16
+  // LLVM-VECTORIZE-NOT: llvm.extractelement
+  // LLVM-VECTORIZE: %[[MASK:.*]] = llvm.icmp "slt" %arg2, %{{.*}} : vector<4xi32>
+  // LLVM-VECTORIZE-NOT: llvm.extractelement
+  // LLVM-VECTORIZE: %[[SCALED:.*]] = llvm.fmul %[[DOT]], %{{.*}} {fastmathFlags = #llvm.fastmath<contract>} : vector<4xf32>
+  // LLVM-VECTORIZE-NOT: llvm.extractelement
+  // LLVM-VECTORIZE: %[[SELECTED:.*]] = llvm.select %[[MASK]], %[[SCALED]], %{{.*}} : vector<4xi1>, vector<4xf32>
+  // LLVM-VECTORIZE-NOT: llvm.extractelement
+  // LLVM-VECTORIZE: %[[MAX:.*]] = llvm.intr.vector.reduce.fmax(%[[SELECTED]]) : (vector<4xf32>) -> f32
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[MAX]] : f32
+  llvm.func @vectorize_mfma_masked_reduce(%a: vector<8xbf16>, %b: vector<8xbf16>, %indices: vector<4xi32>, %limit: i32, %scale: f32) -> f32 {
+    %zero = llvm.mlir.constant(dense<0.0> : vector<4xf32>) : vector<4xf32>
+    %neg_inf = llvm.mlir.constant(0xFF800000 : f32) : f32
+    %u = llvm.mlir.undef : vector<4xf32>
+    %dot = rocdl.mfma.f32.16x16x32.bf16 %a, %b, %zero, 0, 0, none : (vector<8xbf16>, vector<8xbf16>, vector<4xf32>) -> vector<4xf32>
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %x0 = llvm.extractelement %dot[%c0 : i32] : vector<4xf32>
+    %idx0 = llvm.extractelement %indices[%c0 : i32] : vector<4xi32>
+    %m0 = llvm.icmp "slt" %idx0, %limit : i32
+    %scaled0 = llvm.fmul %x0, %scale {fastmathFlags = #llvm.fastmath<contract>} : f32
+    %s0 = llvm.select %m0, %scaled0, %neg_inf : i1, f32
+    %v0 = llvm.insertelement %s0, %u[%c0 : i32] : vector<4xf32>
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %x1 = llvm.extractelement %dot[%c1 : i32] : vector<4xf32>
+    %idx1 = llvm.extractelement %indices[%c1 : i32] : vector<4xi32>
+    %m1 = llvm.icmp "slt" %idx1, %limit : i32
+    %scaled1 = llvm.fmul %x1, %scale {fastmathFlags = #llvm.fastmath<contract>} : f32
+    %s1 = llvm.select %m1, %scaled1, %neg_inf : i1, f32
+    %v1 = llvm.insertelement %s1, %v0[%c1 : i32] : vector<4xf32>
+    %c2 = llvm.mlir.constant(2 : i32) : i32
+    %x2 = llvm.extractelement %dot[%c2 : i32] : vector<4xf32>
+    %idx2 = llvm.extractelement %indices[%c2 : i32] : vector<4xi32>
+    %m2 = llvm.icmp "slt" %idx2, %limit : i32
+    %scaled2 = llvm.fmul %x2, %scale {fastmathFlags = #llvm.fastmath<contract>} : f32
+    %s2 = llvm.select %m2, %scaled2, %neg_inf : i1, f32
+    %v2 = llvm.insertelement %s2, %v1[%c2 : i32] : vector<4xf32>
+    %c3 = llvm.mlir.constant(3 : i32) : i32
+    %x3 = llvm.extractelement %dot[%c3 : i32] : vector<4xf32>
+    %idx3 = llvm.extractelement %indices[%c3 : i32] : vector<4xi32>
+    %m3 = llvm.icmp "slt" %idx3, %limit : i32
+    %scaled3 = llvm.fmul %x3, %scale {fastmathFlags = #llvm.fastmath<contract>} : f32
+    %s3 = llvm.select %m3, %scaled3, %neg_inf : i1, f32
+    %v3 = llvm.insertelement %s3, %v2[%c3 : i32] : vector<4xf32>
+    %max = llvm.intr.vector.reduce.fmax(%v3) : (vector<4xf32>) -> f32
+    llvm.return %max : f32
+  }
+
+  // Predicate and operand order must survive; operands are i64, results i1.
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_unsigned_compare
+  // LLVM-VECTORIZE-NEXT: %[[CMP:.*]] = llvm.icmp "ugt" %arg0, %arg1 : vector<2xi64>
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[CMP]] : vector<2xi1>
+  llvm.func @vectorize_unsigned_compare(%a: vector<2xi64>, %b: vector<2xi64>) -> vector<2xi1> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %a0 = llvm.extractelement %a[%c0 : i32] : vector<2xi64>
+    %a1 = llvm.extractelement %a[%c1 : i32] : vector<2xi64>
+    %b0 = llvm.extractelement %b[%c0 : i32] : vector<2xi64>
+    %b1 = llvm.extractelement %b[%c1 : i32] : vector<2xi64>
+    %m0 = llvm.icmp "ugt" %a0, %b0 : i64
+    %m1 = llvm.icmp "ugt" %a1, %b1 : i64
+    %u = llvm.mlir.undef : vector<2xi1>
+    %v0 = llvm.insertelement %m0, %u[%c0 : i32] : vector<2xi1>
+    %v1 = llvm.insertelement %m1, %v0[%c1 : i32] : vector<2xi1>
+    llvm.return %v1 : vector<2xi1>
+  }
+
+  // A shared scalar condition may be splatted; both vector arms and flags survive.
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_select_shared_condition
+  // LLVM-VECTORIZE-NOT: llvm.extractelement
+  // LLVM-VECTORIZE: %[[SEL:.*]] = llvm.select %{{.*}}, %arg1, %arg2 {fastmathFlags = #llvm.fastmath<nsz>} : {{(vector<2xi1>|i1)}}, vector<2xf32>
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[SEL]] : vector<2xf32>
+  llvm.func @vectorize_select_shared_condition(%condition: i1, %a: vector<2xf32>, %b: vector<2xf32>) -> vector<2xf32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %a0 = llvm.extractelement %a[%c0 : i32] : vector<2xf32>
+    %a1 = llvm.extractelement %a[%c1 : i32] : vector<2xf32>
+    %b0 = llvm.extractelement %b[%c0 : i32] : vector<2xf32>
+    %b1 = llvm.extractelement %b[%c1 : i32] : vector<2xf32>
+    %s0 = llvm.select %condition, %a0, %b0 {fastmathFlags = #llvm.fastmath<nsz>} : i1, f32
+    %s1 = llvm.select %condition, %a1, %b1 {fastmathFlags = #llvm.fastmath<nsz>} : i1, f32
+    %u = llvm.mlir.undef : vector<2xf32>
+    %v0 = llvm.insertelement %s0, %u[%c0 : i32] : vector<2xf32>
+    %v1 = llvm.insertelement %s1, %v0[%c1 : i32] : vector<2xf32>
+    llvm.return %v1 : vector<2xf32>
+  }
+
+  // Different predicates cannot be represented by one vector comparison. The
+  // comparisons remain scalar while their results can feed a vector select.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_mixed_compare_predicates
+  // LLVM-VECTORIZE: llvm.icmp "slt" %arg0, %arg1 : i32
+  // LLVM-VECTORIZE: llvm.icmp "ult" %arg0, %arg1 : i32
+  // LLVM-VECTORIZE-NOT: llvm.icmp {{.*}} : vector<2xi32>
+  // LLVM-VECTORIZE: llvm.select {{.*}}, %arg2, %arg3 : vector<2xi1>, vector<2xi32>
+  // LLVM-VECTORIZE: llvm.return
+  llvm.func @preserve_mixed_compare_predicates(%x: i32, %y: i32, %a: vector<2xi32>, %b: vector<2xi32>) -> vector<2xi32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %a0 = llvm.extractelement %a[%c0 : i32] : vector<2xi32>
+    %a1 = llvm.extractelement %a[%c1 : i32] : vector<2xi32>
+    %b0 = llvm.extractelement %b[%c0 : i32] : vector<2xi32>
+    %b1 = llvm.extractelement %b[%c1 : i32] : vector<2xi32>
+    %m0 = llvm.icmp "slt" %x, %y : i32
+    %m1 = llvm.icmp "ult" %x, %y : i32
+    %s0 = llvm.select %m0, %a0, %b0 : i1, i32
+    %s1 = llvm.select %m1, %a1, %b1 : i1, i32
+    %u = llvm.mlir.undef : vector<2xi32>
+    %v0 = llvm.insertelement %s0, %u[%c0 : i32] : vector<2xi32>
+    %v1 = llvm.insertelement %s1, %v0[%c1 : i32] : vector<2xi32>
+    llvm.return %v1 : vector<2xi32>
+  }
+
+  // Select flags must agree, just like arithmetic flags.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_mixed_select_flags
+  // LLVM-VECTORIZE: llvm.select %arg0, %arg1, %arg2 : i1, f32
+  // LLVM-VECTORIZE: llvm.select %arg0, %arg3, %arg4 {fastmathFlags = #llvm.fastmath<nsz>} : i1, f32
+  // LLVM-VECTORIZE-NOT: llvm.select {{.*}}vector<2xf32>
+  // LLVM-VECTORIZE: llvm.return
+  llvm.func @preserve_mixed_select_flags(%condition: i1, %a: f32, %b: f32, %c: f32, %d: f32) -> vector<2xf32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %s0 = llvm.select %condition, %a, %b : i1, f32
+    %s1 = llvm.select %condition, %c, %d {fastmathFlags = #llvm.fastmath<nsz>} : i1, f32
+    %u = llvm.mlir.undef : vector<2xf32>
+    %v0 = llvm.insertelement %s0, %u[%c0 : i32] : vector<2xf32>
+    %v1 = llvm.insertelement %s1, %v0[%c1 : i32] : vector<2xf32>
+    llvm.return %v1 : vector<2xf32>
+  }
+
+  // Pointer comparisons are scalar leaves; never construct builtin vectors of pointers.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_pointer_compare
+  // LLVM-VECTORIZE: llvm.icmp "eq" %arg0, %arg2 : !llvm.ptr
+  // LLVM-VECTORIZE: llvm.icmp "eq" %arg1, %arg2 : !llvm.ptr
+  // LLVM-VECTORIZE: llvm.return {{.*}} : vector<2xi1>
+  llvm.func @preserve_pointer_compare(%a: !llvm.ptr, %b: !llvm.ptr, %p: !llvm.ptr) -> vector<2xi1> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %m0 = llvm.icmp "eq" %a, %p : !llvm.ptr
+    %m1 = llvm.icmp "eq" %b, %p : !llvm.ptr
+    %u = llvm.mlir.undef : vector<2xi1>
+    %v0 = llvm.insertelement %m0, %u[%c0 : i32] : vector<2xi1>
+    %v1 = llvm.insertelement %m1, %v0[%c1 : i32] : vector<2xi1>
+    llvm.return %v1 : vector<2xi1>
+  }
+
+  // Failure to reconstruct a select arm must preserve the intrinsic boundary.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_select_intrinsic_arm
+  // LLVM-VECTORIZE: %[[PAIR:.*]] = llvm.call_intrinsic "llvm.amdgcn.permlane32.swap"
+  // LLVM-VECTORIZE: %[[LO:.*]] = llvm.extractvalue %[[PAIR]][0] : !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE: %[[HI:.*]] = llvm.extractvalue %[[PAIR]][1] : !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE: llvm.select %arg0, %arg2, %[[LO]] : i1, i32
+  // LLVM-VECTORIZE: llvm.select %arg1, %arg3, %[[HI]] : i1, i32
+  // LLVM-VECTORIZE-NOT: llvm.select {{.*}}vector<2xi32>
+  // LLVM-VECTORIZE: llvm.return
+  llvm.func @preserve_select_intrinsic_arm(%m0: i1, %m1: i1, %a: i32, %b: i32) -> vector<2xi32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %false = llvm.mlir.constant(false) : i1
+    %pair = llvm.call_intrinsic "llvm.amdgcn.permlane32.swap"(%a, %b, %false, %false) : (i32, i32, i1, i1) -> !llvm.struct<(i32, i32)>
+    %lo = llvm.extractvalue %pair[0] : !llvm.struct<(i32, i32)>
+    %hi = llvm.extractvalue %pair[1] : !llvm.struct<(i32, i32)>
+    %s0 = llvm.select %m0, %a, %lo : i1, i32
+    %s1 = llvm.select %m1, %b, %hi : i1, i32
+    %u = llvm.mlir.undef : vector<2xi32>
+    %v0 = llvm.insertelement %s0, %u[%c0 : i32] : vector<2xi32>
+    %v1 = llvm.insertelement %s1, %v0[%c1 : i32] : vector<2xi32>
+    llvm.return %v1 : vector<2xi32>
+  }
+}

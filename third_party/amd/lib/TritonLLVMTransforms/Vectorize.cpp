@@ -519,7 +519,7 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
   Operation *first = values.front().getDefiningOp();
   if (!first)
     return fallback();
-  SmallVector<Value> src0, src1;
+  SmallVector<Value> src0, src1, src2;
   for (Value value : values) {
     Operation *op = value.getDefiningOp();
     if (!op || op->getName() != first->getName())
@@ -530,15 +530,25 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
       src0.push_back(extract.getVector());
       src1.push_back(extract.getPosition());
     } else {
-      // This also preserves fast-math and integer overflow flags without
-      // strengthening the contract of any scalar lane.
+      // Require the same predicate/flags on every lane. Copy these attributes
+      // onto the vector operation without strengthening any lane's contract.
       if (op->getAttrDictionary() != first->getAttrDictionary() ||
           op->getOperandTypes() != first->getOperandTypes())
         return fallback();
-      if (isa<LLVM::TruncOp, LLVM::ZExtOp, LLVM::SExtOp, LLVM::FNegOp,
-              LLVM::FPExtOp, LLVM::FPTruncOp, LLVM::SIToFPOp, LLVM::UIToFPOp,
-              LLVM::FPToSIOp, LLVM::FPToUIOp, LLVM::BitcastOp,
-              LLVM::Exp2Op>(op)) {
+      if (auto select = dyn_cast<LLVM::SelectOp>(op)) {
+        src0.push_back(select.getCondition());
+        src1.push_back(select.getTrueValue());
+        src2.push_back(select.getFalseValue());
+      } else if (auto compare = dyn_cast<LLVM::ICmpOp>(op)) {
+        // Numeric vector reconstruction does not support vectors of pointers.
+        if (!isa<IntegerType>(compare.getLhs().getType()))
+          return fallback();
+        src0.push_back(compare.getLhs());
+        src1.push_back(compare.getRhs());
+      } else if (isa<LLVM::TruncOp, LLVM::ZExtOp, LLVM::SExtOp, LLVM::FNegOp,
+                     LLVM::FPExtOp, LLVM::FPTruncOp, LLVM::SIToFPOp,
+                     LLVM::UIToFPOp, LLVM::FPToSIOp, LLVM::FPToUIOp,
+                     LLVM::BitcastOp, LLVM::Exp2Op>(op)) {
         src0.push_back(op->getOperand(0));
       } else if (isa<LLVM::AddOp, LLVM::SubOp, LLVM::MulOp, LLVM::UDivOp,
                      LLVM::SDivOp, LLVM::URemOp, LLVM::SRemOp, LLVM::AndOp,
@@ -559,9 +569,10 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
   if (isa<LLVM::ConstantOp>(first)) {
     SmallVector<Attribute> elements;
     for (Value value : values)
-      elements.push_back(cast<LLVM::ConstantOp>(value.getDefiningOp()).getValue());
-    return LLVM::ConstantOp::create(
-               builder, loc, dstType, DenseElementsAttr::get(dstType, elements))
+      elements.push_back(
+          cast<LLVM::ConstantOp>(value.getDefiningOp()).getValue());
+    return LLVM::ConstantOp::create(builder, loc, dstType,
+                                    DenseElementsAttr::get(dstType, elements))
         .getResult();
   }
   if (isa<LLVM::ExtractElementOp>(first)) {
@@ -605,7 +616,19 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
     auto rhs = tryVectorizeValues(src1, srcOp);
     if (failed(rhs))
       return fallback();
-    result = createLLVMVecOpBinary(builder, loc, name, *lhs, *rhs, dstType);
+    if (isa<LLVM::SelectOp>(first)) {
+      auto falseValues = tryVectorizeValues(src2, srcOp);
+      if (failed(falseValues))
+        return fallback();
+      result = LLVM::SelectOp::create(builder, loc, dstType, *lhs, *rhs,
+                                      *falseValues);
+    } else if (auto compare = dyn_cast<LLVM::ICmpOp>(first)) {
+      // The operands keep their integer element type; the result is vector<i1>.
+      result = LLVM::ICmpOp::create(builder, loc, compare.getPredicate(), *lhs,
+                                    *rhs);
+    } else {
+      result = createLLVMVecOpBinary(builder, loc, name, *lhs, *rhs, dstType);
+    }
   }
   if (!result)
     return fallback();
