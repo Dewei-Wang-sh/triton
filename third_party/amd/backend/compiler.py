@@ -659,8 +659,7 @@ class HIPBackend(BaseBackend):
         if is_coexec_scheduler_enabled(options.arch) and options.num_warps <= 4:
             kernel_fn.add_fn_attr("amdgpu-sched-strategy", "coexec")
 
-        denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
-        kernel_fn.add_fn_attr("denormal-fp-math-f32", denormal_mode)
+        kernel_fn.set_fp32_denormal_mode(options.allow_flush_denorm)
 
         # Workaround, remove once the LLVM fix lands
         # With this set, waves_per_eu >= 2 uses no AGPRs; waves_per_eu = 1 still gets 256.

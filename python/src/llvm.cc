@@ -5,6 +5,7 @@
 #include "triton/Tools/LLVMOptions.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "triton/Version.h"
+#include "llvm/ADT/FloatingPointMode.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
@@ -16,6 +17,7 @@
 #include "llvm/CodeGen/SchedulerRegistry.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
@@ -580,6 +582,17 @@ void init_triton_llvm(py::module_ &m) {
           py::arg("name"), py::arg("val") = "")
       .def("remove_fn_attr", [](llvm::Function *fn,
                                 std::string &name) { fn->removeFnAttr(name); })
+      .def(
+          "set_fp32_denormal_mode",
+          [](llvm::Function *fn, bool allowFlushDenorm) {
+            auto env = fn->getDenormalFPEnv();
+            env.F32Mode = allowFlushDenorm ? DenormalMode::getPreserveSign()
+                                          : DenormalMode::getIEEE();
+            AttrBuilder attrs(fn->getContext());
+            attrs.addDenormalFPEnvAttr(env);
+            fn->addFnAttrs(attrs);
+          },
+          py::arg("allow_flush_denorm"))
       .def("add_fn_asan_attr",
            [](llvm::Function *fn) {
              fn->addFnAttr(llvm::Attribute::SanitizeAddress);

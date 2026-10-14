@@ -1116,6 +1116,29 @@ def test_math_op(dtype_x, expr, x, device):
     _test_unary(dtype_x, f'tl.{expr}({x})', np_expr, device=device)
 
 
+@pytest.mark.skipif(not is_hip() or is_interpreter(), reason="Requires the AMD compiler")
+@pytest.mark.parametrize("allow_flush_denorm", [False, True])
+def test_exp_fp32_denormal_mode(allow_flush_denorm, device):
+
+    @triton.jit
+    def exp_kernel(x, y):
+        offsets = tl.arange(0, 4)
+        tl.store(y + offsets, tl.exp(tl.load(x + offsets)))
+
+    # exp(-100) is subnormal; exp(-80) is small but still normal in FP32.
+    x_cpu = torch.tensor([-100.0, -80.0, 0.0, 1.0], dtype=torch.float32)
+    x = x_cpu.to(device)
+    y = torch.empty_like(x)
+    exp_kernel[(1, )](x, y, num_warps=1, allow_flush_denorm=allow_flush_denorm)
+
+    expected = torch.exp(x_cpu)
+    if allow_flush_denorm:
+        expected[0] = 0.0
+    actual = y.cpu()
+    assert (actual[0].item() == 0.0) == allow_flush_denorm
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2.0**-149)
+
+
 # Interpreter only patches tensor members marked as builtins.
 # Use float32 because `sqrt_rn` only accepts fp32 tensors.
 @pytest.mark.interpreter

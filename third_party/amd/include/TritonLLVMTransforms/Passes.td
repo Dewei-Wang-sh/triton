@@ -9,7 +9,7 @@ def TritonLLVMVectorize : Pass<"tritonllvm-vectorize", "mlir::ModuleOp"> {
   let description = [{
   }];
 
-  let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+  let dependentDialects = ["mlir::LLVM::LLVMDialect", "mlir::ROCDL::ROCDLDialect"];
 }
 
 

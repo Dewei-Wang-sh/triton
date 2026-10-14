@@ -470,3 +470,157 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     llvm.return %result : f32
   }
 }
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_exp2_ftz
+  // LLVM-VECTORIZE: %[[RESULT:.*]] = llvm.intr.exp2(%arg0) : (vector<2xf32>) -> vector<2xf32>
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[RESULT]] : vector<2xf32>
+  llvm.func @vectorize_exp2_ftz(%x: vector<2xf32>) -> vector<2xf32> attributes {denormal_fpenv = #llvm.denormal_fpenv<default_output_mode = ieee, default_input_mode = ieee, float_output_mode = preservesign, float_input_mode = preservesign>} {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %x0 = llvm.extractelement %x[%c0 : i32] : vector<2xf32>
+    %x1 = llvm.extractelement %x[%c1 : i32] : vector<2xf32>
+    %e0 = rocdl.exp2 %x0 f32 -> f32
+    %e1 = rocdl.exp2 %x1 f32 -> f32
+    %u = llvm.mlir.undef : vector<2xf32>
+    %v0 = llvm.insertelement %e0, %u[%c0 : i32] : vector<2xf32>
+    %v1 = llvm.insertelement %e1, %v0[%c1 : i32] : vector<2xf32>
+    llvm.return %v1 : vector<2xf32>
+  }
+
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_exp2_ieee
+  // LLVM-VECTORIZE: rocdl.exp2
+  // LLVM-VECTORIZE: rocdl.exp2
+  // LLVM-VECTORIZE-NOT: llvm.intr.exp2
+  // LLVM-VECTORIZE: llvm.return
+  llvm.func @preserve_exp2_ieee(%x: vector<2xf32>) -> vector<2xf32> attributes {denormal_fpenv = #llvm.denormal_fpenv<default_output_mode = ieee, default_input_mode = ieee, float_output_mode = ieee, float_input_mode = ieee>} {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %x0 = llvm.extractelement %x[%c0 : i32] : vector<2xf32>
+    %x1 = llvm.extractelement %x[%c1 : i32] : vector<2xf32>
+    %e0 = rocdl.exp2 %x0 f32 -> f32
+    %e1 = rocdl.exp2 %x1 f32 -> f32
+    %u = llvm.mlir.undef : vector<2xf32>
+    %v0 = llvm.insertelement %e0, %u[%c0 : i32] : vector<2xf32>
+    %v1 = llvm.insertelement %e1, %v0[%c1 : i32] : vector<2xf32>
+    llvm.return %v1 : vector<2xf32>
+  }
+
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_exp2_unspecified
+  // LLVM-VECTORIZE: rocdl.exp2
+  // LLVM-VECTORIZE: rocdl.exp2
+  // LLVM-VECTORIZE-NOT: llvm.intr.exp2
+  // LLVM-VECTORIZE: llvm.return
+  llvm.func @preserve_exp2_unspecified(%x: vector<2xf32>) -> vector<2xf32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %x0 = llvm.extractelement %x[%c0 : i32] : vector<2xf32>
+    %x1 = llvm.extractelement %x[%c1 : i32] : vector<2xf32>
+    %e0 = rocdl.exp2 %x0 f32 -> f32
+    %e1 = rocdl.exp2 %x1 f32 -> f32
+    %u = llvm.mlir.undef : vector<2xf32>
+    %v0 = llvm.insertelement %e0, %u[%c0 : i32] : vector<2xf32>
+    %v1 = llvm.insertelement %e1, %v0[%c1 : i32] : vector<2xf32>
+    llvm.return %v1 : vector<2xf32>
+  }
+
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_generic_exp2
+  // LLVM-VECTORIZE: %[[RESULT:.*]] = llvm.intr.exp2(%arg0) {fastmathFlags = #llvm.fastmath<afn>} : (vector<2xf32>) -> vector<2xf32>
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[RESULT]] : vector<2xf32>
+  llvm.func @vectorize_generic_exp2(%x: vector<2xf32>) -> vector<2xf32> attributes {denormal_fpenv = #llvm.denormal_fpenv<default_output_mode = ieee, default_input_mode = ieee, float_output_mode = ieee, float_input_mode = ieee>} {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %x0 = llvm.extractelement %x[%c0 : i32] : vector<2xf32>
+    %x1 = llvm.extractelement %x[%c1 : i32] : vector<2xf32>
+    %e0 = llvm.intr.exp2(%x0) {fastmathFlags = #llvm.fastmath<afn>} : (f32) -> f32
+    %e1 = llvm.intr.exp2(%x1) {fastmathFlags = #llvm.fastmath<afn>} : (f32) -> f32
+    %u = llvm.mlir.undef : vector<2xf32>
+    %v0 = llvm.insertelement %e0, %u[%c0 : i32] : vector<2xf32>
+    %v1 = llvm.insertelement %e1, %v0[%c1 : i32] : vector<2xf32>
+    llvm.return %v1 : vector<2xf32>
+  }
+
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // Interleaved lanes need an insertion point after both operands. This also
+  // covers a scalar block argument, distinct FP constants, and FP flags.
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_fp_exp_chain
+  // LLVM-VECTORIZE-DAG: llvm.mlir.constant(dense<[1.250000e+00, -0.000000e+00]> : vector<2xf32>)
+  // LLVM-VECTORIZE: llvm.fmul {{.*}} {fastmathFlags = #llvm.fastmath<contract>} : vector<2xf32>
+  // LLVM-VECTORIZE: llvm.fsub {{.*}} : vector<2xf32>
+  // LLVM-VECTORIZE: %[[RESULT:.*]] = llvm.intr.exp2({{.*}}) : (vector<2xf32>) -> vector<2xf32>
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[RESULT]] : vector<2xf32>
+  llvm.func @vectorize_fp_exp_chain(%x: vector<2xf32>, %scale: f32) -> vector<2xf32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %a = llvm.mlir.constant(1.25 : f32) : f32
+    %b = llvm.mlir.constant(-0.0 : f32) : f32
+    %u = llvm.mlir.undef : vector<2xf32>
+    %x0 = llvm.extractelement %x[%c0 : i32] : vector<2xf32>
+    %m0 = llvm.fmul %x0, %scale {fastmathFlags = #llvm.fastmath<contract>} : f32
+    %s0 = llvm.fsub %m0, %a : f32
+    %e0 = llvm.intr.exp2(%s0) : (f32) -> f32
+    %v0 = llvm.insertelement %e0, %u[%c0 : i32] : vector<2xf32>
+    %x1 = llvm.extractelement %x[%c1 : i32] : vector<2xf32>
+    %m1 = llvm.fmul %x1, %scale {fastmathFlags = #llvm.fastmath<contract>} : f32
+    %s1 = llvm.fsub %m1, %b : f32
+    %e1 = llvm.intr.exp2(%s1) : (f32) -> f32
+    %v1 = llvm.insertelement %e1, %v0[%c1 : i32] : vector<2xf32>
+    llvm.return %v1 : vector<2xf32>
+  }
+
+  // Scalar arguments and unsupported producers may be packed as operands of
+  // vector arithmetic without trying to reconstruct the producer itself.
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_fp_scalar_leaves
+  // LLVM-VECTORIZE: llvm.select
+  // LLVM-VECTORIZE: llvm.insertelement
+  // LLVM-VECTORIZE: llvm.fadd {{.*}} : vector<2xf32>
+  // LLVM-VECTORIZE: llvm.return {{.*}} : vector<2xf32>
+  llvm.func @vectorize_fp_scalar_leaves(%condition: i1, %a: f32, %b: f32, %c: f32) -> vector<2xf32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %u = llvm.mlir.undef : vector<2xf32>
+    %s = llvm.select %condition, %a, %b : i1, f32
+    %f0 = llvm.fadd %s, %c : f32
+    %f1 = llvm.fadd %b, %c : f32
+    %v0 = llvm.insertelement %f0, %u[%c0 : i32] : vector<2xf32>
+    %v1 = llvm.insertelement %f1, %v0[%c1 : i32] : vector<2xf32>
+    llvm.return %v1 : vector<2xf32>
+  }
+
+  // Different fast-math contracts must not become one flagged vector op.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_mixed_fp_flags
+  // LLVM-VECTORIZE: llvm.fadd {{.*}} : f32
+  // LLVM-VECTORIZE: llvm.fadd {{.*}} {fastmathFlags = #llvm.fastmath<nnan>} : f32
+  // LLVM-VECTORIZE-NOT: llvm.fadd {{.*}} : vector<2xf32>
+  // LLVM-VECTORIZE: llvm.return {{.*}} : vector<2xf32>
+  llvm.func @preserve_mixed_fp_flags(%a: f32, %b: f32, %c: f32) -> vector<2xf32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %u = llvm.mlir.undef : vector<2xf32>
+    %f0 = llvm.fadd %a, %b : f32
+    %f1 = llvm.fadd %a, %c {fastmathFlags = #llvm.fastmath<nnan>} : f32
+    %v0 = llvm.insertelement %f0, %u[%c0 : i32] : vector<2xf32>
+    %v1 = llvm.insertelement %f1, %v0[%c1 : i32] : vector<2xf32>
+    llvm.return %v1 : vector<2xf32>
+  }
+
+  // A mismatched producer must not build a vector from a partial constant list.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_mixed_constant_argument
+  // LLVM-VECTORIZE: llvm.insertelement %arg0, {{.*}} : vector<2xf32>
+  // LLVM-VECTORIZE: llvm.return {{.*}} : vector<2xf32>
+  llvm.func @preserve_mixed_constant_argument(%a: f32) -> vector<2xf32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %u = llvm.mlir.undef : vector<2xf32>
+    %f = llvm.mlir.constant(1.25 : f32) : f32
+    %v0 = llvm.insertelement %f, %u[%c0 : i32] : vector<2xf32>
+    %v1 = llvm.insertelement %a, %v0[%c1 : i32] : vector<2xf32>
+    llvm.return %v1 : vector<2xf32>
+  }
+}

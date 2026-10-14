@@ -10,6 +10,7 @@ add_triton_library(TritonLLVMTransforms
     MLIRIR
     MLIRPass
     MLIRTransforms
+    MLIRROCDLDialect
     MLIRReconcileUnrealizedCasts
     LLVMCore
     LLVMPasses
