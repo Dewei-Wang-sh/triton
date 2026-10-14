@@ -282,3 +282,69 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
     tt.return %rn, %rz : bf16, bf16
   }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: @truncf_bf16_full_width_4
+  // GFX942-NOT: llvm.fptrunc
+  // GFX942-COUNT-4: llvm.bitcast %{{.*}} : i16 to bf16
+  // GFX950: %[[CONVERTED:.*]] = llvm.fptrunc %{{.*}} : vector<4xf32> to vector<4xbf16>
+  // GFX950-NOT: llvm.fptrunc
+  // GFX950-COUNT-4: llvm.extractelement %[[CONVERTED]]
+  // COMMON: llvm.return
+  tt.func @truncf_bf16_full_width_4(%x: tensor<256xf32, #blocked>) {
+    %y = arith.truncf %x : tensor<256xf32, #blocked> to tensor<256xbf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [16], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: @truncf_bf16_full_width_16
+  // GFX942-NOT: llvm.fptrunc
+  // GFX942-COUNT-16: llvm.bitcast %{{.*}} : i16 to bf16
+  // GFX950: %[[CONVERTED:.*]] = llvm.fptrunc %{{.*}} : vector<16xf32> to vector<16xbf16>
+  // GFX950-NOT: llvm.fptrunc
+  // GFX950-COUNT-16: llvm.extractelement %[[CONVERTED]]
+  // COMMON: llvm.return
+  tt.func @truncf_bf16_full_width_16(%x: tensor<1024xf32, #blocked>) {
+    %y = arith.truncf %x : tensor<1024xf32, #blocked> to tensor<1024xbf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [128], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: @truncf_bf16_full_width_128
+  // GFX942-NOT: llvm.fptrunc
+  // GFX942-COUNT-128: llvm.bitcast %{{.*}} : i16 to bf16
+  // GFX950: %[[CONVERTED:.*]] = llvm.fptrunc %{{.*}} : vector<128xf32> to vector<128xbf16>
+  // GFX950-NOT: llvm.fptrunc
+  // GFX950-COUNT-128: llvm.extractelement %[[CONVERTED]]
+  // COMMON: llvm.return
+  tt.func @truncf_bf16_full_width_128(%x: tensor<8192xf32, #blocked>) {
+    %y = arith.truncf %x : tensor<8192xf32, #blocked> to tensor<8192xbf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // A scalar conversion keeps its scalar signature.
+  // COMMON-LABEL: @truncf_bf16_scalar
+  // GFX942-NOT: llvm.fptrunc
+  // GFX942: llvm.bitcast {{.*}} : i16 to bf16
+  // GFX950: llvm.fptrunc %arg0 : f32 to bf16
+  // COMMON: llvm.return
+  tt.func private @truncf_bf16_scalar(%x: f32) -> bf16 {
+    %y = arith.truncf %x : f32 to bf16
+    tt.return %y : bf16
+  }
+}

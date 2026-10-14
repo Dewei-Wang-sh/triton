@@ -750,6 +750,8 @@ public:
     // step 3: canonicalize after vectorization
     OpPassManager pm;
     pm.addPass(mlir::createCanonicalizerPass());
+    // A reduction and a conversion can reconstruct the same wide expression.
+    pm.addPass(mlir::createCSEPass());
     if (failed(runPipeline(pm, m)))
       return signalPassFailure();
     // step 4: print constant human readable

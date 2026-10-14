@@ -105,10 +105,12 @@ SmallVector<Value> convertFp32ToF16rtne(Location loc,
                                         Type inElemTy, Type outElemTy,
                                         MultipleOperandsRange operands,
                                         ISAFamily isaFamily) {
-  // For CDNA4 we can potentially use packed v_cvt_pk_[b]f16_f32 instructions.
+  // Preserve the full per-thread BF16 conversion so its producers can also be
+  // vectorized at that width. LLVM legalizes it to packed conversion instructions.
   if (isCDNA4OrHigher(isaFamily)) {
     SmallVector<Value> inVals;
-    size_t numElem = std::min(size_t(2), operands.size());
+    size_t numElem = outElemTy.isBF16() ? operands.size()
+                                       : std::min(size_t(2), operands.size());
     inVals.reserve(numElem);
     for (unsigned i = 0; i < numElem; i++) {
       inVals.push_back(operands[i][0]);
@@ -877,18 +879,15 @@ SmallVector<Value> convertFp32ToFp16rtne(Location loc,
   if (v.size() == 1)
     return {b.fptrunc(outElemTy, v.front())};
 
-  assert(v.size() == 2);
-  auto inVecTy = vec_ty(f32_ty, 2);
-  auto retVecTy = vec_ty(outElemTy, 2);
+  auto inVecTy = vec_ty(f32_ty, v.size());
+  auto retVecTy = vec_ty(outElemTy, v.size());
   Value inVec = b.undef(inVecTy);
-  auto idx0 = b.i32_val(0);
-  auto idx1 = b.i32_val(1);
-  inVec = b.insert_element(inVecTy, inVec, v[0], idx0);
-  inVec = b.insert_element(inVecTy, inVec, v[1], idx1);
+  for (auto [i, value] : llvm::enumerate(v))
+    inVec = b.insert_element(inVecTy, inVec, value, b.i32_val(i));
   Value retVec = b.fptrunc(retVecTy, inVec);
-  SmallVector<Value> ret(2);
-  ret[0] = b.extract_element(outElemTy, retVec, idx0);
-  ret[1] = b.extract_element(outElemTy, retVec, idx1);
+  SmallVector<Value> ret(v.size());
+  for (size_t i = 0; i < v.size(); ++i)
+    ret[i] = b.extract_element(outElemTy, retVec, b.i32_val(i));
   return ret;
 }
 

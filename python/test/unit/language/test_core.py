@@ -2685,9 +2685,11 @@ def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
 
 
 @pytest.mark.interpreter
-@pytest.mark.parametrize("dtype_x, rounding", [("float32", None), ("float32", "rtne"), ("float32", "rtz"),
-                                               ("float16", None), ("float64", None), ("int64", None), ("uint64", None)])
-def test_cast_bf16_rounding(dtype_x, rounding, device):
+@pytest.mark.parametrize("dtype_x, rounding, size",
+                         [("float32", rounding, size) for rounding in (None, "rtne", "rtz")
+                          for size in (1024, 4096, 32768)] +
+                         [(dtype, None, 1024) for dtype in ("float16", "float64", "int64", "uint64")])
+def test_cast_bf16_rounding(dtype_x, rounding, size, device):
     if not is_interpreter():
         if dtype_x in ["int64", "uint64"] and (is_hip() or (is_cuda() and torch.cuda.get_device_capability()[0] < 9)):
             pytest.skip("64-bit integer to bf16 conversions round through fp32 on this target")
@@ -2713,7 +2715,9 @@ def test_cast_bf16_rounding(dtype_x, rounding, device):
         x = torch.tensor(values, dtype=dtype, device=device)
         expected = torch.tensor(expected, dtype=torch.bfloat16, device=device)
     else:
-        x = torch.randn(1024, dtype=dtype, device=device)
+        # Exercise short and full-width per-thread conversions, including the
+        # widths used by attention probabilities and accumulator stores.
+        x = torch.randn(size, dtype=dtype, device=device)
         # Ties, a carry out of the mantissa and an overflow tell round-to-nearest-even
         # apart from truncation and from rounding ties away from zero.
         x[:8] = torch.tensor([

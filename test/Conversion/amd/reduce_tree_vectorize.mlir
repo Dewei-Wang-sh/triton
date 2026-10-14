@@ -784,3 +784,80 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     llvm.return %v1 : vector<2xi32>
   }
 }
+
+// -----
+
+// A full-width truncation pack exposes the same scalar exp2 group as a
+// reduction. Reconstruct it once and share the vector result between both.
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_exp2_shared_by_trunc_and_reduce
+  // LLVM-VECTORIZE-NOT: llvm.intr.exp2
+  // LLVM-VECTORIZE: %[[EXP:.*]] = llvm.intr.exp2(%arg0) {fastmathFlags = #llvm.fastmath<afn>} : (vector<8xf32>) -> vector<8xf32>
+  // LLVM-VECTORIZE: %[[SUM:.*]] = "llvm.intr.vector.reduce.fadd"(%{{.*}}, %[[EXP]])
+  // LLVM-VECTORIZE-NOT: llvm.intr.exp2
+  // LLVM-VECTORIZE: %[[BF:.*]] = llvm.fptrunc %[[EXP]] : vector<8xf32> to vector<8xbf16>
+  // LLVM-VECTORIZE: %[[LO:.*]] = llvm.shufflevector %[[BF]], %[[BF]] [0, 1] : vector<8xbf16>
+  // LLVM-VECTORIZE: %[[HI:.*]] = llvm.shufflevector %[[BF]], %[[BF]] [2, 3] : vector<8xbf16>
+  // LLVM-VECTORIZE: %[[A:.*]] = llvm.bitcast %[[LO]] : vector<2xbf16> to i32
+  // LLVM-VECTORIZE: %[[B:.*]] = llvm.bitcast %[[HI]] : vector<2xbf16> to i32
+  // LLVM-VECTORIZE: %[[PAIR:.*]] = llvm.call_intrinsic "llvm.amdgcn.permlane32.swap"(%[[A]], %[[B]], %{{.*}}, %{{.*}}) : (i32, i32, i1, i1) -> !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE: llvm.extractvalue %[[PAIR]][1] : !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NOT: llvm.intr.exp2
+  // LLVM-VECTORIZE: llvm.return %[[SUM]] : f32
+  llvm.func @vectorize_exp2_shared_by_trunc_and_reduce(%x: vector<8xf32>, %out: !llvm.ptr) -> f32 {
+    %u = llvm.mlir.undef : vector<8xf32>
+    %zero = llvm.mlir.constant(-0.0 : f32) : f32
+    %false = llvm.mlir.constant(false) : i1
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %x0 = llvm.extractelement %x[%c0 : i32] : vector<8xf32>
+    %e0 = llvm.intr.exp2(%x0) {fastmathFlags = #llvm.fastmath<afn>} : (f32) -> f32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %x1 = llvm.extractelement %x[%c1 : i32] : vector<8xf32>
+    %e1 = llvm.intr.exp2(%x1) {fastmathFlags = #llvm.fastmath<afn>} : (f32) -> f32
+    %c2 = llvm.mlir.constant(2 : i32) : i32
+    %x2 = llvm.extractelement %x[%c2 : i32] : vector<8xf32>
+    %e2 = llvm.intr.exp2(%x2) {fastmathFlags = #llvm.fastmath<afn>} : (f32) -> f32
+    %c3 = llvm.mlir.constant(3 : i32) : i32
+    %x3 = llvm.extractelement %x[%c3 : i32] : vector<8xf32>
+    %e3 = llvm.intr.exp2(%x3) {fastmathFlags = #llvm.fastmath<afn>} : (f32) -> f32
+    %c4 = llvm.mlir.constant(4 : i32) : i32
+    %x4 = llvm.extractelement %x[%c4 : i32] : vector<8xf32>
+    %e4 = llvm.intr.exp2(%x4) {fastmathFlags = #llvm.fastmath<afn>} : (f32) -> f32
+    %c5 = llvm.mlir.constant(5 : i32) : i32
+    %x5 = llvm.extractelement %x[%c5 : i32] : vector<8xf32>
+    %e5 = llvm.intr.exp2(%x5) {fastmathFlags = #llvm.fastmath<afn>} : (f32) -> f32
+    %c6 = llvm.mlir.constant(6 : i32) : i32
+    %x6 = llvm.extractelement %x[%c6 : i32] : vector<8xf32>
+    %e6 = llvm.intr.exp2(%x6) {fastmathFlags = #llvm.fastmath<afn>} : (f32) -> f32
+    %c7 = llvm.mlir.constant(7 : i32) : i32
+    %x7 = llvm.extractelement %x[%c7 : i32] : vector<8xf32>
+    %e7 = llvm.intr.exp2(%x7) {fastmathFlags = #llvm.fastmath<afn>} : (f32) -> f32
+    %r0 = llvm.insertelement %e0, %u[%c0 : i32] : vector<8xf32>
+    %r1 = llvm.insertelement %e1, %r0[%c1 : i32] : vector<8xf32>
+    %r2 = llvm.insertelement %e2, %r1[%c2 : i32] : vector<8xf32>
+    %r3 = llvm.insertelement %e3, %r2[%c3 : i32] : vector<8xf32>
+    %r4 = llvm.insertelement %e4, %r3[%c4 : i32] : vector<8xf32>
+    %r5 = llvm.insertelement %e5, %r4[%c5 : i32] : vector<8xf32>
+    %r6 = llvm.insertelement %e6, %r5[%c6 : i32] : vector<8xf32>
+    %r7 = llvm.insertelement %e7, %r6[%c7 : i32] : vector<8xf32>
+    %sum = "llvm.intr.vector.reduce.fadd"(%zero, %r7) <{fastmathFlags = #llvm.fastmath<reassoc>}> : (f32, vector<8xf32>) -> f32
+    %t0 = llvm.insertelement %e0, %u[%c0 : i32] : vector<8xf32>
+    %t1 = llvm.insertelement %e1, %t0[%c1 : i32] : vector<8xf32>
+    %t2 = llvm.insertelement %e2, %t1[%c2 : i32] : vector<8xf32>
+    %t3 = llvm.insertelement %e3, %t2[%c3 : i32] : vector<8xf32>
+    %t4 = llvm.insertelement %e4, %t3[%c4 : i32] : vector<8xf32>
+    %t5 = llvm.insertelement %e5, %t4[%c5 : i32] : vector<8xf32>
+    %t6 = llvm.insertelement %e6, %t5[%c6 : i32] : vector<8xf32>
+    %t7 = llvm.insertelement %e7, %t6[%c7 : i32] : vector<8xf32>
+    %bf = llvm.fptrunc %t7 : vector<8xf32> to vector<8xbf16>
+    llvm.store %bf, %out : vector<8xbf16>, !llvm.ptr
+    %lo = llvm.shufflevector %bf, %bf [0, 1] : vector<8xbf16>
+    %hi = llvm.shufflevector %bf, %bf [2, 3] : vector<8xbf16>
+    %a = llvm.bitcast %lo : vector<2xbf16> to i32
+    %b = llvm.bitcast %hi : vector<2xbf16> to i32
+    %pair = llvm.call_intrinsic "llvm.amdgcn.permlane32.swap"(%a, %b, %false, %false) : (i32, i32, i1, i1) -> !llvm.struct<(i32, i32)>
+    %field = llvm.extractvalue %pair[1] : !llvm.struct<(i32, i32)>
+    llvm.store %field, %out : i32, !llvm.ptr
+    llvm.return %sum : f32
+  }
+}
