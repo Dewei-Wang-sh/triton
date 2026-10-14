@@ -25,6 +25,68 @@ namespace mlir {
 #include "TritonLLVMTransforms/Passes.h.inc"
 
 namespace {
+// Keep the intrinsic's aggregate result and its scalar extractions together.
+// A vector overload, if one exists, requires an intrinsic-specific rewrite.
+bool isIntrinsicResultExtraction(LLVM::ExtractValueOp op) {
+  return isa_and_nonnull<LLVM::CallIntrinsicOp>(
+      op.getContainer().getDefiningOp());
+}
+
+// A vector is an alternate SSA representation of a numeric tuple, not a
+// replacement for its storage layout or an intrinsic/function signature.
+VectorType getNumericTupleVectorType(LLVM::LLVMStructType type) {
+  if (!type || type.isIdentified() || type.isPacked() || type.isOpaque())
+    return {};
+  auto body = type.getBody();
+  if (body.empty() || !isa<IntegerType, FloatType>(body.front()) ||
+      !LLVM::isCompatibleType(body.front()) || !llvm::all_equal(body))
+    return {};
+  return VectorType::get({static_cast<int64_t>(body.size())}, body.front());
+}
+
+// Disabled: intrinsic results and their scalar extractions are preserved.
+// Re-enable only when general tuple/vector boundary adaptation is needed.
+/*
+Value materializeTupleAsVector(OpBuilder &builder, VectorType type,
+                               ValueRange inputs, Location loc) {
+  if (inputs.size() != 1 ||
+      getNumericTupleVectorType(
+          dyn_cast<LLVM::LLVMStructType>(inputs.front().getType())) != type)
+    return {};
+
+  Value vector = LLVM::UndefOp::create(builder, loc, type);
+  for (int64_t i = 0; i < type.getNumElements(); ++i) {
+    Value element =
+        LLVM::ExtractValueOp::create(builder, loc, type.getElementType(),
+                                     inputs.front(), ArrayRef<int64_t>{i});
+    Value index =
+        LLVM::ConstantOp::create(builder, loc, builder.getI32Type(), i);
+    vector = LLVM::InsertElementOp::create(builder, loc, type, vector, element,
+                                           index);
+  }
+  return vector;
+}
+
+Value materializeVectorAsTuple(OpBuilder &builder, LLVM::LLVMStructType type,
+                               ValueRange inputs, Location loc) {
+  auto vectorType = getNumericTupleVectorType(type);
+  if (!vectorType || inputs.size() != 1 ||
+      inputs.front().getType() != vectorType)
+    return {};
+
+  Value tuple = LLVM::UndefOp::create(builder, loc, type);
+  for (int64_t i = 0; i < vectorType.getNumElements(); ++i) {
+    Value index =
+        LLVM::ConstantOp::create(builder, loc, builder.getI32Type(), i);
+    Value element = LLVM::ExtractElementOp::create(
+        builder, loc, vectorType.getElementType(), inputs.front(), index);
+    tuple = LLVM::InsertValueOp::create(builder, loc, type, tuple, element,
+                                        ArrayRef<int64_t>{i});
+  }
+  return tuple;
+}
+*/
+
 class ConvertUndef : public OpConversionPattern<LLVM::UndefOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
@@ -67,6 +129,8 @@ public:
   LogicalResult
   matchAndRewrite(LLVM::ExtractValueOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (isIntrinsicResultExtraction(op))
+      return failure();
     Type oldTy = op.getContainer().getType();
     Type newTy = getTypeConverter()->convertType(oldTy);
     if (newTy != oldTy) {
@@ -403,6 +467,14 @@ checkPositionSequentialFromZero(SmallVectorImpl<Value> &positions) {
 
 FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
                                     Operation *srcOp, bool enforce = true) {
+  // Intrinsic calls and preserved aggregate extractions are boundaries for
+  // reconstruction. Keep the existing pack rather than attempting to vectorize
+  // an intrinsic or an ABI object.
+  if (llvm::any_of(values, [](Value value) {
+        return isa_and_nonnull<LLVM::CallIntrinsicOp, LLVM::ExtractValueOp>(
+            value.getDefiningOp());
+      }))
+    return failure();
   // srcs can be all same, group same, group repeating, all different
   auto [subSize, isRepeating] = inferSubVectorSize(values);
   llvm::dbgs() << "try to vectorize from: " << values[0] << "\n";
@@ -418,6 +490,8 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
     groupValuesIntoChunks(values, subSize, groups);
     SmallVector<Value> vecSubVals;
     auto firstSubVec = tryVectorizeValues(groups[0], srcOp, enforce);
+    if (failed(firstSubVec))
+      return failure();
     vecSubVals.push_back(*firstSubVec);
     for (unsigned i = 1; i < groups.size(); ++i) {
       if (isRepeating) {
@@ -425,6 +499,8 @@ FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
         continue;
       } else {
         auto subVecVal = tryVectorizeValues(groups[i], srcOp, enforce);
+        if (failed(subVecVal))
+          return failure();
         vecSubVals.push_back(*subVecVal);
       }
     }
@@ -605,7 +681,7 @@ tryVectorizeInsertChain(LLVM::InsertElementOp insert,
   auto [dst, srcs, positions, ops] = getChainOps(insert);
   visitedInsert.insert(ops.begin(), ops.end());
   if (srcs.size() != insert.getVector().getType().getNumElements() ||
-      srcs.size() == 1)
+      srcs.size() == 1 || !llvm::isPowerOf2_64(srcs.size()))
     return failure();
   bool res = std::get<0>(checkPositionSequentialFromZero(positions));
   if (!res)
@@ -643,20 +719,29 @@ public:
     mlir::TypeConverter converter;
     converter.addConversion([](Type type) { return type; });
     converter.addConversion([](LLVM::LLVMStructType type) -> Type {
-      auto body = type.getBody();
-      if (body.empty())
-        return type;
-      llvm::SmallSetVector<Type, 4> uniqueTypes(body.begin(), body.end());
-      if (uniqueTypes.size() == 1) {
-        return VectorType::get({static_cast<int64_t>(body.size())}, body[0]);
-      }
+      if (auto vectorType = getNumericTupleVectorType(type))
+        return vectorType;
       return type;
     });
+    // General tuple/vector boundary adapters are disabled. Intrinsic calls
+    // and their direct aggregate extractions remain legal below.
+    // converter.addTargetMaterialization(materializeTupleAsVector);
+    // converter.addSourceMaterialization(materializeVectorAsTuple);
 
     mlir::ConversionTarget target(*context);
     target.addLegalDialect<LLVM::LLVMDialect>();
-    target.addDynamicallyLegalOp<LLVM::UndefOp, LLVM::InsertValueOp,
-                                 LLVM::ExtractValueOp, LLVM::BrOp>(
+    target.addLegalOp<LLVM::CallIntrinsicOp>();
+    target.addDynamicallyLegalOp<LLVM::UndefOp, LLVM::InsertValueOp>(
+        [&](Operation *op) {
+          return converter.isLegal(op->getResult(0).getType());
+        });
+    target.addDynamicallyLegalOp<LLVM::ExtractValueOp>(
+        [&](LLVM::ExtractValueOp op) {
+          // Do not request a vector adapter merely to read an intrinsic result.
+          return isIntrinsicResultExtraction(op) ||
+                 converter.isLegal(op.getContainer().getType());
+        });
+    target.addDynamicallyLegalOp<LLVM::BrOp>(
         [&](Operation *op) { return converter.isLegal(op); });
 
     RewritePatternSet patterns(context);

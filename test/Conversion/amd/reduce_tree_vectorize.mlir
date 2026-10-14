@@ -2,7 +2,7 @@
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 -cse | FileCheck %s --check-prefix=GFX942
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 -cse | FileCheck %s --check-prefix=GFX950
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 -cse | FileCheck %s --check-prefix=GFX1250
-// RUN: triton-opt %s -split-input-file --tritonllvm-vectorize | FileCheck %s --check-prefix=LLVM-VECTORIZE
+// RUN: triton-opt %s -split-input-file --tritonllvm-vectorize | FileCheck %s --check-prefix=LLVM-VECTORIZE --implicit-check-not=builtin.unrealized_conversion_cast
 
 #blocked_reduce = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
@@ -143,4 +143,230 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     %v1 = llvm.insertelement %r1, %v0[%c1 : i32] : vector<2xi32>
     llvm.return %v1 : vector<2xi32>
   }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // Preserve the intrinsic result and scalar arithmetic even when the scalar
+  // results are subsequently packed into an existing vector.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_permlane32_result
+  // LLVM-VECTORIZE-DAG: %[[ZERO:.*]] = llvm.mlir.constant(0 : i32) : i32
+  // LLVM-VECTORIZE-DAG: %[[ONE:.*]] = llvm.mlir.constant(1 : i32) : i32
+  // LLVM-VECTORIZE-DAG: %[[UNDEF:.*]] = llvm.mlir.undef : vector<2xi32>
+  // LLVM-VECTORIZE: %[[SWAP:.*]] = llvm.call_intrinsic "llvm.amdgcn.permlane32.swap"
+  // LLVM-VECTORIZE-SAME: -> !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NEXT: %[[LO:.*]] = llvm.extractvalue %[[SWAP]][0] : !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NEXT: %[[HI:.*]] = llvm.extractvalue %[[SWAP]][1] : !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NEXT: %[[ADDLO:.*]] = llvm.add %[[LO]], %[[ONE]] : i32
+  // LLVM-VECTORIZE-NEXT: %[[ADDHI:.*]] = llvm.add %[[HI]], %[[ONE]] : i32
+  // LLVM-VECTORIZE-NEXT: %[[VLO:.*]] = llvm.insertelement %[[ADDLO]], %[[UNDEF]][%[[ZERO]] : i32] : vector<2xi32>
+  // LLVM-VECTORIZE-NEXT: %[[VHI:.*]] = llvm.insertelement %[[ADDHI]], %[[VLO]][%[[ONE]] : i32] : vector<2xi32>
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[VHI]] : vector<2xi32>
+  llvm.func @preserve_permlane32_result(%a: i32, %b: i32) -> vector<2xi32> {
+    %false = llvm.mlir.constant(false) : i1
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %pair = llvm.call_intrinsic "llvm.amdgcn.permlane32.swap"(%a, %b, %false, %false) : (i32, i32, i1, i1) -> !llvm.struct<(i32, i32)>
+    %lo = llvm.extractvalue %pair[0] : !llvm.struct<(i32, i32)>
+    %hi = llvm.extractvalue %pair[1] : !llvm.struct<(i32, i32)>
+    %x0 = llvm.add %lo, %c1 : i32
+    %x1 = llvm.add %hi, %c1 : i32
+    %u = llvm.mlir.undef : vector<2xi32>
+    %v0 = llvm.insertelement %x0, %u[%c0 : i32] : vector<2xi32>
+    %v1 = llvm.insertelement %x1, %v0[%c1 : i32] : vector<2xi32>
+    llvm.return %v1 : vector<2xi32>
+  }
+
+  // A scalar consumer keeps its direct extraction without a vector adapter.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_permlane16_scalar
+  // LLVM-VECTORIZE-NEXT: %[[FALSE:.*]] = llvm.mlir.constant(false) : i1
+  // LLVM-VECTORIZE-NEXT: %[[SWAP16:.*]] = llvm.call_intrinsic "llvm.amdgcn.permlane16.swap"(%arg0, %arg1, %[[FALSE]], %[[FALSE]])
+  // LLVM-VECTORIZE-SAME: -> !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NEXT: %[[HIGH:.*]] = llvm.extractvalue %[[SWAP16]][1] : !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[HIGH]] : i32
+  llvm.func @preserve_permlane16_scalar(%a: i32, %b: i32) -> i32 {
+    %false = llvm.mlir.constant(false) : i1
+    %pair = llvm.call_intrinsic "llvm.amdgcn.permlane16.swap"(%a, %b, %false, %false) : (i32, i32, i1, i1) -> !llvm.struct<(i32, i32)>
+    %hi = llvm.extractvalue %pair[1] : !llvm.struct<(i32, i32)>
+    llvm.return %hi : i32
+  }
+
+  // The Gluon MLA reduction exchanges a pair, reduces its scalar fields, and
+  // repeats with permlane16. Keep that sequence unchanged at the MLIR level.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_mla_permlane_sequence
+  // LLVM-VECTORIZE-NEXT: %[[FALSE:.*]] = llvm.mlir.constant(false) : i1
+  // LLVM-VECTORIZE-NEXT: %[[BITS:.*]] = llvm.bitcast %arg0 : f32 to i32
+  // LLVM-VECTORIZE-NEXT: %[[PAIR32:.*]] = llvm.call_intrinsic "llvm.amdgcn.permlane32.swap"(%[[BITS]], %[[BITS]], %[[FALSE]], %[[FALSE]]) : (i32, i32, i1, i1) -> !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NEXT: %[[LO32:.*]] = llvm.extractvalue %[[PAIR32]][0] : !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NEXT: %[[HI32:.*]] = llvm.extractvalue %[[PAIR32]][1] : !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NEXT: %[[FLO32:.*]] = llvm.bitcast %[[LO32]] : i32 to f32
+  // LLVM-VECTORIZE-NEXT: %[[FHI32:.*]] = llvm.bitcast %[[HI32]] : i32 to f32
+  // LLVM-VECTORIZE-NEXT: %[[MAX32:.*]] = llvm.intr.maxnum(%[[FLO32]], %[[FHI32]]) : (f32, f32) -> f32
+  // LLVM-VECTORIZE-NEXT: %[[BITS32:.*]] = llvm.bitcast %[[MAX32]] : f32 to i32
+  // LLVM-VECTORIZE-NEXT: %[[PAIR16:.*]] = llvm.call_intrinsic "llvm.amdgcn.permlane16.swap"(%[[BITS32]], %[[BITS32]], %[[FALSE]], %[[FALSE]]) : (i32, i32, i1, i1) -> !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NEXT: %[[LO16:.*]] = llvm.extractvalue %[[PAIR16]][0] : !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NEXT: %[[HI16:.*]] = llvm.extractvalue %[[PAIR16]][1] : !llvm.struct<(i32, i32)>
+  // LLVM-VECTORIZE-NEXT: %[[FLO16:.*]] = llvm.bitcast %[[LO16]] : i32 to f32
+  // LLVM-VECTORIZE-NEXT: %[[FHI16:.*]] = llvm.bitcast %[[HI16]] : i32 to f32
+  // LLVM-VECTORIZE-NEXT: %[[MAX16:.*]] = llvm.intr.maxnum(%[[FLO16]], %[[FHI16]]) : (f32, f32) -> f32
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[MAX16]] : f32
+  llvm.func @preserve_mla_permlane_sequence(%x: f32) -> f32 {
+    %false = llvm.mlir.constant(false) : i1
+    %bits = llvm.bitcast %x : f32 to i32
+    %pair32 = llvm.call_intrinsic "llvm.amdgcn.permlane32.swap"(%bits, %bits, %false, %false) : (i32, i32, i1, i1) -> !llvm.struct<(i32, i32)>
+    %lo32 = llvm.extractvalue %pair32[0] : !llvm.struct<(i32, i32)>
+    %hi32 = llvm.extractvalue %pair32[1] : !llvm.struct<(i32, i32)>
+    %flo32 = llvm.bitcast %lo32 : i32 to f32
+    %fhi32 = llvm.bitcast %hi32 : i32 to f32
+    %max32 = llvm.intr.maxnum(%flo32, %fhi32) : (f32, f32) -> f32
+    %bits32 = llvm.bitcast %max32 : f32 to i32
+    %pair16 = llvm.call_intrinsic "llvm.amdgcn.permlane16.swap"(%bits32, %bits32, %false, %false) : (i32, i32, i1, i1) -> !llvm.struct<(i32, i32)>
+    %lo16 = llvm.extractvalue %pair16[0] : !llvm.struct<(i32, i32)>
+    %hi16 = llvm.extractvalue %pair16[1] : !llvm.struct<(i32, i32)>
+    %flo16 = llvm.bitcast %lo16 : i32 to f32
+    %fhi16 = llvm.bitcast %hi16 : i32 to f32
+    %max16 = llvm.intr.maxnum(%flo16, %fhi16) : (f32, f32) -> f32
+    llvm.return %max16 : f32
+  }
+
+  // The rule covers any call_intrinsic, including vector-capable intrinsics
+  // with homogeneous struct results; it is not a permlane name blacklist.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_intrinsic_tuple
+  // LLVM-VECTORIZE-NEXT: %[[PAIR:.*]] = llvm.call_intrinsic "llvm.sincos"(%arg0) : (f32) -> !llvm.struct<(f32, f32)>
+  // LLVM-VECTORIZE-NEXT: %[[SIN:.*]] = llvm.extractvalue %[[PAIR]][0] : !llvm.struct<(f32, f32)>
+  // LLVM-VECTORIZE-NEXT: %[[COS:.*]] = llvm.extractvalue %[[PAIR]][1] : !llvm.struct<(f32, f32)>
+  // LLVM-VECTORIZE-NEXT: %[[SUM:.*]] = llvm.fadd %[[SIN]], %[[COS]] : f32
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[SUM]] : f32
+  llvm.func @preserve_intrinsic_tuple(%x: f32) -> f32 {
+    %pair = llvm.call_intrinsic "llvm.sincos"(%x) : (f32) -> !llvm.struct<(f32, f32)>
+    %sin = llvm.extractvalue %pair[0] : !llvm.struct<(f32, f32)>
+    %cos = llvm.extractvalue %pair[1] : !llvm.struct<(f32, f32)>
+    %sum = llvm.fadd %sin, %cos : f32
+    llvm.return %sum : f32
+  }
+
+  // The arithmetic reconstruction stage must also leave scalar intrinsic
+  // calls alone when their results are packed into a vector.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_scalar_intrinsics
+  // LLVM-VECTORIZE: %[[X0:.*]] = llvm.extractelement %arg0[{{.*}}] : vector<2xf32>
+  // LLVM-VECTORIZE-NEXT: %[[X1:.*]] = llvm.extractelement %arg0[{{.*}}] : vector<2xf32>
+  // LLVM-VECTORIZE-NEXT: %[[EXP0:.*]] = llvm.call_intrinsic "llvm.exp"(%[[X0]]) : (f32) -> f32
+  // LLVM-VECTORIZE-NEXT: %[[EXP1:.*]] = llvm.call_intrinsic "llvm.exp"(%[[X1]]) : (f32) -> f32
+  // LLVM-VECTORIZE-NEXT: %[[V0:.*]] = llvm.insertelement %[[EXP0]], {{.*}} : vector<2xf32>
+  // LLVM-VECTORIZE-NEXT: %[[V1:.*]] = llvm.insertelement %[[EXP1]], %[[V0]][{{.*}}] : vector<2xf32>
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[V1]] : vector<2xf32>
+  llvm.func @preserve_scalar_intrinsics(%x: vector<2xf32>) -> vector<2xf32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c1 = llvm.mlir.constant(1 : i32) : i32
+    %x0 = llvm.extractelement %x[%c0 : i32] : vector<2xf32>
+    %x1 = llvm.extractelement %x[%c1 : i32] : vector<2xf32>
+    %exp0 = llvm.call_intrinsic "llvm.exp"(%x0) : (f32) -> f32
+    %exp1 = llvm.call_intrinsic "llvm.exp"(%x1) : (f32) -> f32
+    %u = llvm.mlir.undef : vector<2xf32>
+    %v0 = llvm.insertelement %exp0, %u[%c0 : i32] : vector<2xf32>
+    %v1 = llvm.insertelement %exp1, %v0[%c1 : i32] : vector<2xf32>
+    llvm.return %v1 : vector<2xf32>
+  }
+
+  // Already-vector intrinsics also remain legal in their original form.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_vector_intrinsic
+  // LLVM-VECTORIZE-NEXT: %[[EXP:.*]] = llvm.call_intrinsic "llvm.exp"(%arg0) : (vector<2xf32>) -> vector<2xf32>
+  // LLVM-VECTORIZE-NEXT: llvm.return %[[EXP]] : vector<2xf32>
+  llvm.func @preserve_vector_intrinsic(%x: vector<2xf32>) -> vector<2xf32> {
+    %exp = llvm.call_intrinsic "llvm.exp"(%x) : (vector<2xf32>) -> vector<2xf32>
+    llvm.return %exp : vector<2xf32>
+  }
+
+  // Disabled with tuple/vector materializations; these cases need adapters.
+  // Return types are also fixed boundaries: the converted producer must be
+  // materialized back to the declared struct type.
+  // ADAPTER-ONLY-LABEL: llvm.func @vectorize_tuple_return
+  // ADAPTER-ONLY-SAME: -> !llvm.struct<(i32, i32)>
+  // ADAPTER-ONLY: %[[X0:.*]] = llvm.extractelement %arg0[{{.*}}] : vector<2xi32>
+  // ADAPTER-ONLY: %[[S0:.*]] = llvm.insertvalue %[[X0]], {{.*}}[0] : !llvm.struct<(i32, i32)>
+  // ADAPTER-ONLY: %[[X1:.*]] = llvm.extractelement %arg0[{{.*}}] : vector<2xi32>
+  // ADAPTER-ONLY: %[[S1:.*]] = llvm.insertvalue %[[X1]], %[[S0]][1] : !llvm.struct<(i32, i32)>
+  // ADAPTER-ONLY: llvm.return %[[S1]] : !llvm.struct<(i32, i32)>
+  // llvm.func @vectorize_tuple_return(%x: vector<2xi32>) -> !llvm.struct<(i32, i32)> {
+  //   %c0 = llvm.mlir.constant(0 : i32) : i32
+  //   %c1 = llvm.mlir.constant(1 : i32) : i32
+  //   %x0 = llvm.extractelement %x[%c0 : i32] : vector<2xi32>
+  //   %x1 = llvm.extractelement %x[%c1 : i32] : vector<2xi32>
+  //   %u = llvm.mlir.undef : !llvm.struct<(i32, i32)>
+  //   %s0 = llvm.insertvalue %x0, %u[0] : !llvm.struct<(i32, i32)>
+  //   %s1 = llvm.insertvalue %x1, %s0[1] : !llvm.struct<(i32, i32)>
+  //   llvm.return %s1 : !llvm.struct<(i32, i32)>
+  // }
+
+  // Pointer aggregates are outside numeric tuple vectorization.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_pointer_tuple
+  // LLVM-VECTORIZE: llvm.extractvalue %arg0[0] : !llvm.struct<(ptr, ptr)>
+  // LLVM-VECTORIZE: llvm.return {{.*}} : !llvm.ptr
+  llvm.func @preserve_pointer_tuple(%p: !llvm.struct<(ptr, ptr)>) -> !llvm.ptr {
+    %x = llvm.extractvalue %p[0] : !llvm.struct<(ptr, ptr)>
+    llvm.return %x : !llvm.ptr
+  }
+
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_packed_tuple
+  // LLVM-VECTORIZE: llvm.extractvalue %arg0[1] : !llvm.struct<packed (i32, i32)>
+  llvm.func @preserve_packed_tuple(%p: !llvm.struct<packed (i32, i32)>) -> i32 {
+    %x = llvm.extractvalue %p[1] : !llvm.struct<packed (i32, i32)>
+    llvm.return %x : i32
+  }
+
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_named_tuple
+  // LLVM-VECTORIZE: llvm.extractvalue %arg0[0] : !llvm.struct<"fixed_pair", (i32, i32)>
+  llvm.func @preserve_named_tuple(%p: !llvm.struct<"fixed_pair", (i32, i32)>) -> i32 {
+    %x = llvm.extractvalue %p[0] : !llvm.struct<"fixed_pair", (i32, i32)>
+    llvm.return %x : i32
+  }
+
+  // Nested homogeneous aggregates cannot be vector elements.
+  // LLVM-VECTORIZE-LABEL: llvm.func @preserve_nested_tuple
+  // LLVM-VECTORIZE: llvm.extractvalue %arg0[1] : !llvm.struct<(array<2 x i32>, array<2 x i32>)>
+  llvm.func @preserve_nested_tuple(%p: !llvm.struct<(array<2 x i32>, array<2 x i32>)>) -> !llvm.array<2 x i32> {
+    %x = llvm.extractvalue %p[1] : !llvm.struct<(array<2 x i32>, array<2 x i32>)>
+    llvm.return %x : !llvm.array<2 x i32>
+  }
+
+  // Disabled with tuple/vector materializations; these cases need adapters.
+  // Nested numeric tuples also stay aggregates, including when a converted
+  // inner tuple is inserted back into its outer container.
+  // ADAPTER-ONLY-LABEL: llvm.func @preserve_nested_numeric_tuple
+  // ADAPTER-ONLY-SAME: %arg0: !llvm.struct<(struct<(i32, i32)>, struct<(i32, i32)>)>
+  // ADAPTER-ONLY: llvm.extractvalue %arg0[0, 1] : !llvm.struct<(struct<(i32, i32)>, struct<(i32, i32)>)>
+  // ADAPTER-ONLY: llvm.insertvalue {{.*}}, %arg0[1] : !llvm.struct<(struct<(i32, i32)>, struct<(i32, i32)>)>
+  // ADAPTER-ONLY: llvm.return {{.*}} : !llvm.struct<(struct<(i32, i32)>, struct<(i32, i32)>)>
+  // llvm.func @preserve_nested_numeric_tuple(%p: !llvm.struct<(struct<(i32, i32)>, struct<(i32, i32)>)>) -> !llvm.struct<(struct<(i32, i32)>, struct<(i32, i32)>)> {
+  //   %a = llvm.extractvalue %p[0] : !llvm.struct<(struct<(i32, i32)>, struct<(i32, i32)>)>
+  //   %x = llvm.mlir.constant(7 : i32) : i32
+  //   %a1 = llvm.insertvalue %x, %a[0] : !llvm.struct<(i32, i32)>
+  //   %r = llvm.insertvalue %a1, %p[1] : !llvm.struct<(struct<(i32, i32)>, struct<(i32, i32)>)>
+  //   llvm.return %r : !llvm.struct<(struct<(i32, i32)>, struct<(i32, i32)>)>
+  // }
+
+  // Disabled with tuple/vector materializations; these cases need adapters.
+  // A non-power-of-two tuple may be packed without invoking the binary-tree
+  // arithmetic reconstruction. Check floating-point numeric fields as well.
+  // ADAPTER-ONLY-LABEL: llvm.func @vectorize_float_triple
+  // ADAPTER-ONLY-SAME: %arg0: !llvm.struct<(f32, f32, f32)>
+  // ADAPTER-ONLY: llvm.extractvalue %arg0[0] : !llvm.struct<(f32, f32, f32)>
+  // ADAPTER-ONLY: llvm.extractvalue %arg0[1] : !llvm.struct<(f32, f32, f32)>
+  // ADAPTER-ONLY: llvm.extractvalue %arg0[2] : !llvm.struct<(f32, f32, f32)>
+  // ADAPTER-ONLY: llvm.return {{.*}} : vector<3xf32>
+  // llvm.func @vectorize_float_triple(%p: !llvm.struct<(f32, f32, f32)>) -> vector<3xf32> {
+  //   %c0 = llvm.mlir.constant(0 : i32) : i32
+  //   %c1 = llvm.mlir.constant(1 : i32) : i32
+  //   %c2 = llvm.mlir.constant(2 : i32) : i32
+  //   %x0 = llvm.extractvalue %p[0] : !llvm.struct<(f32, f32, f32)>
+  //   %x1 = llvm.extractvalue %p[1] : !llvm.struct<(f32, f32, f32)>
+  //   %x2 = llvm.extractvalue %p[2] : !llvm.struct<(f32, f32, f32)>
+  //   %u = llvm.mlir.undef : vector<3xf32>
+  //   %v0 = llvm.insertelement %x0, %u[%c0 : i32] : vector<3xf32>
+  //   %v1 = llvm.insertelement %x1, %v0[%c1 : i32] : vector<3xf32>
+  //   %v2 = llvm.insertelement %x2, %v1[%c2 : i32] : vector<3xf32>
+  //   llvm.return %v2 : vector<3xf32>
+  // }
+
 }
