@@ -2,8 +2,10 @@
 
 #include <memory>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
+#include "mlir/Conversion/ArithCommon/AttrToLLVMConverter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Support/LLVM.h"
@@ -17,6 +19,7 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
@@ -169,19 +172,6 @@ private:
     }
   }
 
-  void packVectorized(SmallVector<SmallVector<Value>> &accs,
-                      ConversionPatternRewriter &rewriter) const {
-    auto loc = accs.front().front().getLoc();
-    for (auto &acc : accs) {
-      SmallVector<Value> packedAcc;
-      for (unsigned reg = 0; reg < acc.size(); reg += 2) {
-        auto vector = packLLVector(loc, {acc[reg], acc[reg + 1]}, rewriter);
-        packedAcc.emplace_back(std::move(vector));
-      }
-      acc = std::move(packedAcc);
-    }
-  }
-
   using InThreadVectorizeOpKind = ReduceOpHelper::InThreadVectorizeOpKind;
 
   template <typename Op>
@@ -239,25 +229,115 @@ private:
     return storage;
   }
 
-  void unpackVectorized(Location loc, SmallVector<SmallVector<Value>> &accs,
-                        ConversionPatternRewriter &rewriter,
-                        Region *reduction) const {
-    for (auto &acc : accs) {
-      SmallVector<Value> unpacked;
-      for (Value val : acc) {
-        auto elems = unpackLLVector(loc, val, rewriter);
-        assert(elems.size() == 2 && "expected a 2-lane packed vector");
-        if (reduction) {
-          SmallVector<Value> cur = {elems[0]};
-          accumulate(loc, rewriter, *reduction, cur, {elems[1]});
-          unpacked.emplace_back(cur[0]);
-        } else {
-          unpacked.emplace_back(elems[0]);
-          unpacked.emplace_back(elems[1]);
-        }
+  template <typename ReductionOp>
+  static Value
+  createVectorReduction(Location loc, ConversionPatternRewriter &rewriter,
+                        Operation *combiner, ArrayRef<Value> values) {
+    Type elementType = values.front().getType();
+    Value vector = packLLVector(loc, values, rewriter);
+    if constexpr (std::is_same_v<ReductionOp, LLVM::vector_reduce_fadd> ||
+                  std::is_same_v<ReductionOp, LLVM::vector_reduce_fmul> ||
+                  std::is_same_v<ReductionOp, LLVM::vector_reduce_fmin> ||
+                  std::is_same_v<ReductionOp, LLVM::vector_reduce_fmax> ||
+                  std::is_same_v<ReductionOp, LLVM::vector_reduce_fminimum> ||
+                  std::is_same_v<ReductionOp, LLVM::vector_reduce_fmaximum>) {
+      auto flags = arith::convertArithFastMathFlagsToLLVM(
+          cast<arith::ArithFastMathInterface>(combiner)
+              .getFastMathFlagsAttr()
+              .getValue());
+      if constexpr (std::is_same_v<ReductionOp, LLVM::vector_reduce_fadd> ||
+                    std::is_same_v<ReductionOp, LLVM::vector_reduce_fmul>) {
+        // Triton reductions already permit reassociation. Use -0.0 for addition
+        // so an all-negative-zero group retains its sign without assuming nsz.
+        flags = flags | LLVM::FastmathFlags::reassoc;
+        double identity =
+            std::is_same_v<ReductionOp, LLVM::vector_reduce_fadd> ? -0.0 : 1.0;
+        Value start = LLVM::ConstantOp::create(
+            rewriter, loc, elementType,
+            rewriter.getFloatAttr(elementType, identity));
+        return ReductionOp::create(rewriter, loc, elementType, start, vector,
+                                   flags);
+      } else {
+        return ReductionOp::create(rewriter, loc, elementType, vector, flags);
       }
-      acc = std::move(unpacked);
+    } else {
+      return ReductionOp::create(rewriter, loc, elementType, vector);
     }
+  }
+
+  // Only bypass a region that consists of a builtin combiner and its return.
+  // getSingleCombiner also accepts regions with extra operations (e.g. prints),
+  // which must still execute through the ordinary combine-region path.
+  Value tryVectorReduction(triton::ReduceOp op, ArrayRef<Value> values,
+                           ConversionPatternRewriter &rewriter) const {
+    Operation *combiner = op.getSingleCombiner();
+    if (!combiner ||
+        !llvm::hasSingleElement(op.getCombineOp().front().without_terminator()))
+      return {};
+
+    auto loc = op.getLoc();
+    return llvm::TypeSwitch<Operation *, Value>(combiner)
+        .Case<arith::AddIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_add>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MulIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_mul>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::AndIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_and>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::OrIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_or>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::XOrIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_xor>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MinSIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_smin>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MaxSIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_smax>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MinUIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_umin>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MaxUIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_umax>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::AddFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fadd>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MulFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fmul>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MinNumFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fmin>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MaxNumFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fmax>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MinimumFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fminimum>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MaximumFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fmaximum>(
+              loc, rewriter, combiner, values);
+        })
+        .Default([](Operation *) { return Value{}; });
   }
 
   // Reduce along the op axis for elements that are in the same thread. The
@@ -277,15 +357,9 @@ private:
       return {std::move(layout), std::move(accs)};
     }
 
-    // Create the vectorized region if needed.
-    auto vectorCombineRegion =
-        axisPack >= 4 ? createVectorCombineRegion(
-                            op, targetInfo.supportBitwidth32Elementwise())
-                      : nullptr;
-    bool vectorize = vectorCombineRegion != nullptr;
-
-    // Bring the registers that move the axis to the front.
-    auto perm = ReduceOpHelper::moveAxisBasesToFront(layout, axis, vectorize);
+    // Keep every local group contiguous, including when independent outputs
+    // were originally interleaved in the register layout.
+    auto perm = ReduceOpHelper::moveAxisBasesToFront(layout, axis, false);
     if (!perm.isIdentity()) {
       layout = perm.apply(layout);
       for (auto &vals : accs) {
@@ -293,31 +367,23 @@ private:
       }
     }
 
-    // Pack the inputs into vector values.
-    if (vectorize)
-      packVectorized(accs, rewriter);
-
-    // If we pack along the reduction axis, we need to process half the
-    // registers.
-    const auto &regBases = layout.getBases().lookup(kReg);
-    bool packAlongAxis = vectorize && regBases.front()[axis] != 0;
-    if (packAlongAxis)
-      axisPack /= 2;
-
-    Region &combineRegion =
-        vectorCombineRegion ? *vectorCombineRegion : op.getCombineOp();
-
-    Operation *combinerOp = vectorCombineRegion
-                                ? &vectorCombineRegion->front().front()
-                                : op.getSingleCombiner();
+    Operation *combinerOp = op.getSingleCombiner();
     unsigned arity =
         combinerOp ? targetInfo.getReductionTreeArity(combinerOp) : 2;
 
-    // Perform a tree reduction
+    // Prefer a full-width vector reduction for a simple builtin combiner.
     unsigned numOperands = accs.size();
     SmallVector<SmallVector<Value>> reduced(numOperands);
     unsigned regs = accs.front().size();
     for (unsigned regBase = 0; regBase < regs; regBase += axisPack) {
+      if (numOperands == 1) {
+        auto values = ArrayRef<Value>(accs.front()).slice(regBase, axisPack);
+        if (Value result = tryVectorReduction(op, values, rewriter)) {
+          reduced.front().push_back(result);
+          continue;
+        }
+      }
+      // Custom and tuple combiners retain the original tree reduction.
       // Transpose from [opIdx][reg] into [reg][opIdx]
       SmallVector<SmallVector<Value>> vals;
       for (unsigned i = 0; i < axisPack; ++i) {
@@ -328,21 +394,12 @@ private:
         vals.push_back(std::move(cur));
       }
       auto acc =
-          treeReduce(loc, rewriter, combineRegion, std::move(vals), arity);
+          treeReduce(loc, rewriter, op.getCombineOp(), std::move(vals), arity);
       for (unsigned opIdx = 0; opIdx < numOperands; ++opIdx) {
         reduced[opIdx].push_back(acc[opIdx]);
       }
     }
     accs = std::move(reduced);
-
-    // Unpack the vector values into the accumulator values.
-    // Reduce one last time via the scalar combine op if we packed along the
-    // axis.
-    if (vectorize) {
-      Region *reduceAfterUnpacking =
-          packAlongAxis ? &op.getCombineOp() : nullptr;
-      unpackVectorized(loc, accs, rewriter, reduceAfterUnpacking);
-    }
 
     // Update the layout, killing the axis bases along registers.
     layout = ReduceOpHelper::zeroBasesAlongDimAndReorder(layout, axis, kReg);

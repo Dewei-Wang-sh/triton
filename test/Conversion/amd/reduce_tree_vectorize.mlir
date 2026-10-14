@@ -1,15 +1,13 @@
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx90a -cse | FileCheck %s --check-prefix=GFX90A
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 -cse | FileCheck %s --check-prefix=GFX942
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 -cse | FileCheck %s --check-prefix=GFX950
-// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 -cse | FileCheck %s --check-prefix=GFX1250
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx90a -cse | FileCheck %s --check-prefix=LOCAL
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx942 -cse | FileCheck %s --check-prefix=LOCAL
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx950 -cse | FileCheck %s --check-prefix=LOCAL
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 -cse | FileCheck %s --check-prefix=LOCAL
 // RUN: triton-opt %s -split-input-file --tritonllvm-vectorize | FileCheck %s --check-prefix=LLVM-VECTORIZE --implicit-check-not=builtin.unrealized_conversion_cast
 
 #blocked_reduce = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // GFX942-LABEL: reduce_f16
-  // GFX942: llvm.fadd {{.*}} : vector<2xf16>
-  // GFX950-LABEL: reduce_f16
-  // GFX950: llvm.fadd {{.*}} : vector<2xf16>
+  // LOCAL-LABEL: reduce_f16
+  // LOCAL: "llvm.intr.vector.reduce.fadd"(%{{.*}}, %{{.*}}) <{fastmathFlags = #llvm.fastmath<reassoc>}> : (f16, vector<4xf16>) -> f16
   tt.func public @reduce_f16(%arg0: tensor<1x256xf16, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f16, %b: f16):
@@ -19,12 +17,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return
   }
 
-  // GFX90A-LABEL: reduce_f32
-  // GFX90A: llvm.fadd {{.*}} : vector<2xf32>
-  // GFX942-LABEL: reduce_f32
-  // GFX942: llvm.fadd {{.*}} : vector<2xf32>
-  // GFX950-LABEL: reduce_f32
-  // GFX950: llvm.fadd {{.*}} : vector<2xf32>
+  // LOCAL-LABEL: reduce_f32
+  // LOCAL: "llvm.intr.vector.reduce.fadd"(%{{.*}}, %{{.*}}) <{fastmathFlags = #llvm.fastmath<reassoc>}> : (f32, vector<4xf32>) -> f32
   tt.func public @reduce_f32(%arg0: tensor<1x256xf32, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f32, %b: f32):
@@ -39,9 +33,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 
 #blocked_reduce = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  // GFX1250-LABEL: reduce_f16_tree_vectorize
-  // GFX1250: llvm.fadd {{.*}} : vector<2xf16>
-  tt.func public @reduce_f16_tree_vectorize(%arg0: tensor<1x128xf16, #blocked_reduce>) {
+  // LOCAL-LABEL: reduce_f16_vector_reduce
+  // LOCAL: "llvm.intr.vector.reduce.fadd"(%{{.*}}, %{{.*}}) <{fastmathFlags = #llvm.fastmath<reassoc>}> : (f16, vector<4xf16>) -> f16
+  tt.func public @reduce_f16_vector_reduce(%arg0: tensor<1x128xf16, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f16, %b: f16):
       %sum = arith.addf %a, %b : f16
@@ -50,9 +44,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return
   }
 
-  // GFX1250-LABEL: reduce_f32_tree_vectorize
-  // GFX1250: llvm.fadd {{.*}} : vector<2xf32>
-  tt.func public @reduce_f32_tree_vectorize(%arg0: tensor<1x128xf32, #blocked_reduce>) {
+  // LOCAL-LABEL: reduce_f32_vector_reduce
+  // LOCAL: "llvm.intr.vector.reduce.fadd"(%{{.*}}, %{{.*}}) <{fastmathFlags = #llvm.fastmath<reassoc>}> : (f32, vector<4xf32>) -> f32
+  tt.func public @reduce_f32_vector_reduce(%arg0: tensor<1x128xf32, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f32, %b: f32):
       %sum = arith.addf %a, %b : f32
@@ -61,14 +55,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return
   }
 
-  // Ternary tree reduction for max/min: generates a chain of 3 dependent ops
-  // per group so LLVM can fold into v_maximum3/v_minimum3/v_max3/v_min3.
+  // Full local reductions are left for LLVM to select the target tree.
 
-  // GFX1250-LABEL: reduce_maximum_f32_ternary
-  // GFX1250: %[[A:.*]] = llvm.intr.maximum(%{{.*}}, %{{.*}}) : (f32, f32) -> f32
-  // GFX1250-NEXT: %[[B:.*]] = llvm.intr.maximum(%[[A]], %{{.*}}) : (f32, f32) -> f32
-  // GFX1250-NEXT: %[[C:.*]] = llvm.intr.maximum(%[[B]], %{{.*}}) : (f32, f32) -> f32
-  tt.func public @reduce_maximum_f32_ternary(%arg0: tensor<1x128xf32, #blocked_reduce>) {
+  // LOCAL-LABEL: reduce_maximum_f32_vector_reduce
+  // LOCAL: llvm.intr.vector.reduce.fmaximum(%{{.*}}) : (vector<4xf32>) -> f32
+  tt.func public @reduce_maximum_f32_vector_reduce(%arg0: tensor<1x128xf32, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f32, %b: f32):
       %max = arith.maximumf %a, %b : f32
@@ -77,11 +68,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return
   }
 
-  // GFX1250-LABEL: reduce_minimum_f32_ternary
-  // GFX1250: %[[A:.*]] = llvm.intr.minimum(%{{.*}}, %{{.*}}) : (f32, f32) -> f32
-  // GFX1250-NEXT: %[[B:.*]] = llvm.intr.minimum(%[[A]], %{{.*}}) : (f32, f32) -> f32
-  // GFX1250-NEXT: %[[C:.*]] = llvm.intr.minimum(%[[B]], %{{.*}}) : (f32, f32) -> f32
-  tt.func public @reduce_minimum_f32_ternary(%arg0: tensor<1x128xf32, #blocked_reduce>) {
+  // LOCAL-LABEL: reduce_minimum_f32_vector_reduce
+  // LOCAL: llvm.intr.vector.reduce.fminimum(%{{.*}}) : (vector<4xf32>) -> f32
+  tt.func public @reduce_minimum_f32_vector_reduce(%arg0: tensor<1x128xf32, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f32, %b: f32):
       %min = arith.minimumf %a, %b : f32
@@ -90,11 +79,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return
   }
 
-  // GFX1250-LABEL: reduce_maxnum_f32_ternary
-  // GFX1250: %[[A:.*]] = llvm.intr.maxnum(%{{.*}}, %{{.*}}) : (f32, f32) -> f32
-  // GFX1250-NEXT: %[[B:.*]] = llvm.intr.maxnum(%[[A]], %{{.*}}) : (f32, f32) -> f32
-  // GFX1250-NEXT: %[[C:.*]] = llvm.intr.maxnum(%[[B]], %{{.*}}) : (f32, f32) -> f32
-  tt.func public @reduce_maxnum_f32_ternary(%arg0: tensor<1x128xf32, #blocked_reduce>) {
+  // LOCAL-LABEL: reduce_maxnum_f32_vector_reduce
+  // LOCAL: llvm.intr.vector.reduce.fmax(%{{.*}}) : (vector<4xf32>) -> f32
+  tt.func public @reduce_maxnum_f32_vector_reduce(%arg0: tensor<1x128xf32, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f32, %b: f32):
       %max = arith.maxnumf %a, %b : f32
@@ -103,11 +90,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return
   }
 
-  // GFX1250-LABEL: reduce_minnum_f32_ternary
-  // GFX1250: %[[A:.*]] = llvm.intr.minnum(%{{.*}}, %{{.*}}) : (f32, f32) -> f32
-  // GFX1250-NEXT: %[[B:.*]] = llvm.intr.minnum(%[[A]], %{{.*}}) : (f32, f32) -> f32
-  // GFX1250-NEXT: %[[C:.*]] = llvm.intr.minnum(%[[B]], %{{.*}}) : (f32, f32) -> f32
-  tt.func public @reduce_minnum_f32_ternary(%arg0: tensor<1x128xf32, #blocked_reduce>) {
+  // LOCAL-LABEL: reduce_minnum_f32_vector_reduce
+  // LOCAL: llvm.intr.vector.reduce.fmin(%{{.*}}) : (vector<4xf32>) -> f32
+  tt.func public @reduce_minnum_f32_vector_reduce(%arg0: tensor<1x128xf32, #blocked_reduce>) {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%a: f32, %b: f32):
       %min = arith.minnumf %a, %b : f32

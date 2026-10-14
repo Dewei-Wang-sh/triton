@@ -1,8 +1,8 @@
 // RUN: triton-opt %s --allocate-shared-memory --convert-triton-gpu-to-llvm --convert-nv-gpu-to-llvm | mlir-translate -mlir-to-llvmir | opt -S -O1 | FileCheck %s
-// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=88' -cse | FileCheck %s --check-prefixes=TERNARY,REDUX,FASTMINMAX
-// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=80 ptx-version=80' -cse | FileCheck %s --check-prefixes=PRE100,REDUX,SLOWMINMAX
-// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=80' -cse | FileCheck %s --check-prefixes=PRE100,REDUX,SLOWMINMAX,PACKEDSHFL
-// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=120 ptx-version=88' -cse | FileCheck %s --check-prefixes=REDUX,FASTMINMAX
+// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=88' -cse | FileCheck %s --check-prefixes=LOCAL,TERNARY,REDUX,FASTMINMAX
+// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=80 ptx-version=80' -cse | FileCheck %s --check-prefixes=LOCAL,PRE100,REDUX,SLOWMINMAX
+// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=80' -cse | FileCheck %s --check-prefixes=LOCAL,PRE100,REDUX,SLOWMINMAX,PACKEDSHFL
+// RUN: triton-opt %s --convert-triton-gpu-to-llvm='compute-capability=120 ptx-version=88' -cse | FileCheck %s --check-prefixes=LOCAL,REDUX,FASTMINMAX
 
 #linear = #ttg.linear<{register = [[0, 2], [2, 0]], lane = [[0, 8], [8, 0], [1, 0], [4, 0], [16, 0]], warp = [[0, 1], [0, 4]], block = []}>
 #blocked_reduce = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -18,6 +18,17 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
 
 // CHECK-LABEL: @reduce_linear_layout
+// LOCAL-LABEL: @reduce_linear_layout
+// LOCAL: %[[SRC0:.*]] = llvm.extractvalue %arg0[0]
+// LOCAL: %[[SRC1:.*]] = llvm.extractvalue %arg0[1]
+// LOCAL: %[[SRC2:.*]] = llvm.extractvalue %arg0[2]
+// LOCAL: %[[SRC3:.*]] = llvm.extractvalue %arg0[3]
+// LOCAL: %[[V00:.*]] = llvm.insertelement %[[SRC0]], %{{.*}}[%{{.*}} : i32] : vector<2xi32>
+// LOCAL: %[[V02:.*]] = llvm.insertelement %[[SRC2]], %[[V00]][%{{.*}} : i32] : vector<2xi32>
+// LOCAL: "llvm.intr.vector.reduce.add"(%[[V02]]) : (vector<2xi32>) -> i32
+// LOCAL: %[[V11:.*]] = llvm.insertelement %[[SRC1]], %{{.*}}[%{{.*}} : i32] : vector<2xi32>
+// LOCAL: %[[V13:.*]] = llvm.insertelement %[[SRC3]], %[[V11]][%{{.*}} : i32] : vector<2xi32>
+// LOCAL: "llvm.intr.vector.reduce.add"(%[[V13]]) : (vector<2xi32>) -> i32
 tt.func private @reduce_linear_layout(%arg0: tensor<32x16xi32, #linear>) -> tensor<16xi32, #ttg.slice<{dim = 0, parent = #linear}>> {
   // CHECK-NEXT: [[SRC0:%.*]] = extractvalue {{.*}} %0, 0
   // CHECK-NEXT: [[SRC1:%.*]] = extractvalue {{.*}} %0, 1
@@ -38,8 +49,12 @@ tt.func private @reduce_linear_layout(%arg0: tensor<32x16xi32, #linear>) -> tens
   // is not needed.
 
   // Reduce within threads
-  // CHECK: [[SUM0:%.*]] = add i32 [[SRC0]], [[SRC2]]
-  // CHECK-NEXT: [[SUM1:%.*]] = add i32 [[SRC1]], [[SRC3]]
+  // CHECK: [[V00:%.*]] = insertelement <2 x i32> poison, i32 [[SRC0]], i64 0
+  // CHECK-NEXT: [[V02:%.*]] = insertelement <2 x i32> [[V00]], i32 [[SRC2]], i64 1
+  // CHECK-NEXT: [[SUM0:%.*]] = tail call i32 @llvm.vector.reduce.add.v2i32(<2 x i32> [[V02]])
+  // CHECK-NEXT: [[V11:%.*]] = insertelement <2 x i32> poison, i32 [[SRC1]], i64 0
+  // CHECK-NEXT: [[V13:%.*]] = insertelement <2 x i32> [[V11]], i32 [[SRC3]], i64 1
+  // CHECK-NEXT: [[SUM1:%.*]] = tail call i32 @llvm.vector.reduce.add.v2i32(<2 x i32> [[V13]])
 
   // Reduce the even and odd lanes separately with converged full-warp redux.
   // CHECK-NEXT: [[TID:%.*]] = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
@@ -100,10 +115,10 @@ tt.func public @reduce_maximum_with_print(%ptr: !llvm.ptr, %arg0: tensor<128x4xi
   tt.return
 }
 
-// TERNARY-LABEL: @reduce_maximum_f32
-// TERNARY: %[[MAXIMUM_A:.*]] = llvm.intr.maximum(%{{.*}}, %{{.*}}) : (f32, f32) -> f32
-// TERNARY-NEXT: %[[MAXIMUM_B:.*]] = llvm.intr.maximum(%[[MAXIMUM_A]], %{{.*}}) : (f32, f32) -> f32
-// TERNARY-NEXT: llvm.intr.maximum(%[[MAXIMUM_B]], %{{.*}}) : (f32, f32) -> f32
+// LOCAL-LABEL: @reduce_maximum_f32
+// LOCAL: llvm.intr.vector.reduce.fmaximum(%{{.*}}) : (vector<4xf32>) -> f32
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
 tt.func private @reduce_maximum_f32(%arg0: tensor<128x4xf32, #blocked_reduce>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%a: f32, %b: f32):
@@ -113,10 +128,10 @@ tt.func private @reduce_maximum_f32(%arg0: tensor<128x4xf32, #blocked_reduce>) -
   tt.return %0 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
 }
 
-// TERNARY-LABEL: @reduce_minimum_f32
-// TERNARY: %[[MINIMUM_A:.*]] = llvm.intr.minimum(%{{.*}}, %{{.*}}) : (f32, f32) -> f32
-// TERNARY-NEXT: %[[MINIMUM_B:.*]] = llvm.intr.minimum(%[[MINIMUM_A]], %{{.*}}) : (f32, f32) -> f32
-// TERNARY-NEXT: llvm.intr.minimum(%[[MINIMUM_B]], %{{.*}}) : (f32, f32) -> f32
+// LOCAL-LABEL: @reduce_minimum_f32
+// LOCAL: llvm.intr.vector.reduce.fminimum(%{{.*}}) : (vector<4xf32>) -> f32
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
 tt.func private @reduce_minimum_f32(%arg0: tensor<128x4xf32, #blocked_reduce>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%a: f32, %b: f32):
@@ -126,10 +141,10 @@ tt.func private @reduce_minimum_f32(%arg0: tensor<128x4xf32, #blocked_reduce>) -
   tt.return %0 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
 }
 
-// TERNARY-LABEL: @reduce_maxnum_f32
-// TERNARY: %[[MAXNUM_A:.*]] = llvm.intr.maxnum(%{{.*}}, %{{.*}}) : (f32, f32) -> f32
-// TERNARY-NEXT: %[[MAXNUM_B:.*]] = llvm.intr.maxnum(%[[MAXNUM_A]], %{{.*}}) : (f32, f32) -> f32
-// TERNARY-NEXT: llvm.intr.maxnum(%[[MAXNUM_B]], %{{.*}}) : (f32, f32) -> f32
+// LOCAL-LABEL: @reduce_maxnum_f32
+// LOCAL: llvm.intr.vector.reduce.fmax(%{{.*}}) : (vector<4xf32>) -> f32
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
 tt.func private @reduce_maxnum_f32(%arg0: tensor<128x4xf32, #blocked_reduce>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%a: f32, %b: f32):
@@ -139,10 +154,10 @@ tt.func private @reduce_maxnum_f32(%arg0: tensor<128x4xf32, #blocked_reduce>) ->
   tt.return %0 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
 }
 
-// TERNARY-LABEL: @reduce_minnum_f32
-// TERNARY: %[[MINNUM_A:.*]] = llvm.intr.minnum(%{{.*}}, %{{.*}}) : (f32, f32) -> f32
-// TERNARY-NEXT: %[[MINNUM_B:.*]] = llvm.intr.minnum(%[[MINNUM_A]], %{{.*}}) : (f32, f32) -> f32
-// TERNARY-NEXT: llvm.intr.minnum(%[[MINNUM_B]], %{{.*}}) : (f32, f32) -> f32
+// LOCAL-LABEL: @reduce_minnum_f32
+// LOCAL: llvm.intr.vector.reduce.fmin(%{{.*}}) : (vector<4xf32>) -> f32
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
 tt.func private @reduce_minnum_f32(%arg0: tensor<128x4xf32, #blocked_reduce>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%a: f32, %b: f32):
@@ -152,10 +167,10 @@ tt.func private @reduce_minnum_f32(%arg0: tensor<128x4xf32, #blocked_reduce>) ->
   tt.return %0 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
 }
 
-// TERNARY-LABEL: @reduce_maxsi_i32
-// TERNARY: %[[SMAX_A:.*]] = llvm.intr.smax(%{{.*}}, %{{.*}}) : (i32, i32) -> i32
-// TERNARY-NEXT: %[[SMAX_B:.*]] = llvm.intr.smax(%[[SMAX_A]], %{{.*}}) : (i32, i32) -> i32
-// TERNARY-NEXT: llvm.intr.smax(%[[SMAX_B]], %{{.*}}) : (i32, i32) -> i32
+// LOCAL-LABEL: @reduce_maxsi_i32
+// LOCAL: "llvm.intr.vector.reduce.smax"(%{{.*}}) : (vector<4xi32>) -> i32
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
 tt.func private @reduce_maxsi_i32(%arg0: tensor<128x4xi32, #blocked_reduce>) -> tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%a: i32, %b: i32):
@@ -165,10 +180,10 @@ tt.func private @reduce_maxsi_i32(%arg0: tensor<128x4xi32, #blocked_reduce>) -> 
   tt.return %0 : tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
 }
 
-// TERNARY-LABEL: @reduce_minui_i16
-// TERNARY: %[[PACKED_UMIN_A:.*]] = llvm.intr.umin(%{{.*}}, %{{.*}}) : (vector<2xi16>, vector<2xi16>) -> vector<2xi16>
-// TERNARY-NEXT: %[[PACKED_UMIN_B:.*]] = llvm.intr.umin(%[[PACKED_UMIN_A]], %{{.*}}) : (vector<2xi16>, vector<2xi16>) -> vector<2xi16>
-// TERNARY-NEXT: llvm.intr.umin(%[[PACKED_UMIN_B]], %{{.*}}) : (vector<2xi16>, vector<2xi16>) -> vector<2xi16>
+// LOCAL-LABEL: @reduce_minui_i16
+// LOCAL: "llvm.intr.vector.reduce.umin"(%{{.*}}) : (vector<8xi16>) -> i16
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
 tt.func private @reduce_minui_i16(%arg0: tensor<128x8xi16, #blocked_packed_reduce>) -> tensor<128xi16, #ttg.slice<{dim = 1, parent = #blocked_packed_reduce}>> {
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%a: i16, %b: i16):
@@ -179,9 +194,10 @@ tt.func private @reduce_minui_i16(%arg0: tensor<128x8xi16, #blocked_packed_reduc
 }
 
 // A supported opcode need not combine the block arguments.
-// TERNARY-LABEL: @reduce_captured_combiner
-// TERNARY-NOT: vector<2xi16>
-// TERNARY: llvm.return
+// LOCAL-LABEL: @reduce_captured_combiner
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL-NOT: vector<2xi16>
+// LOCAL: llvm.return
 tt.func public @reduce_captured_combiner(%arg0: tensor<256x4xi16, #blocked_nonaxis_packed_reduce>, %value: i16, %out: tensor<256x!tt.ptr<i16>, #ttg.slice<{dim = 1, parent = #blocked_nonaxis_packed_reduce}>>) {
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%a: i16, %b: i16):
@@ -192,10 +208,10 @@ tt.func public @reduce_captured_combiner(%arg0: tensor<256x4xi16, #blocked_nonax
   tt.return
 }
 
-// TERNARY-LABEL: @reduce_maxnum_f16
-// TERNARY: %[[PACKED_MAXNUM_A:.*]] = llvm.intr.maxnum(%{{.*}}, %{{.*}}) : (vector<2xf16>, vector<2xf16>) -> vector<2xf16>
-// TERNARY-NEXT: %[[PACKED_MAXNUM_B:.*]] = llvm.intr.maxnum(%[[PACKED_MAXNUM_A]], %{{.*}}) : (vector<2xf16>, vector<2xf16>) -> vector<2xf16>
-// TERNARY-NEXT: llvm.intr.maxnum(%[[PACKED_MAXNUM_B]], %{{.*}}) : (vector<2xf16>, vector<2xf16>) -> vector<2xf16>
+// LOCAL-LABEL: @reduce_maxnum_f16
+// LOCAL: llvm.intr.vector.reduce.fmax(%{{.*}}) : (vector<8xf16>) -> f16
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
 tt.func private @reduce_maxnum_f16(%arg0: tensor<128x8xf16, #blocked_packed_reduce>) -> tensor<128xf16, #ttg.slice<{dim = 1, parent = #blocked_packed_reduce}>> {
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%a: f16, %b: f16):
@@ -205,10 +221,10 @@ tt.func private @reduce_maxnum_f16(%arg0: tensor<128x8xf16, #blocked_packed_redu
   tt.return %0 : tensor<128xf16, #ttg.slice<{dim = 1, parent = #blocked_packed_reduce}>>
 }
 
-// TERNARY-LABEL: @reduce_minimum_bf16
-// TERNARY: %[[PACKED_MINIMUM_A:.*]] = llvm.intr.minimum(%{{.*}}, %{{.*}}) : (vector<2xbf16>, vector<2xbf16>) -> vector<2xbf16>
-// TERNARY-NEXT: %[[PACKED_MINIMUM_B:.*]] = llvm.intr.minimum(%[[PACKED_MINIMUM_A]], %{{.*}}) : (vector<2xbf16>, vector<2xbf16>) -> vector<2xbf16>
-// TERNARY-NEXT: llvm.intr.minimum(%[[PACKED_MINIMUM_B]], %{{.*}}) : (vector<2xbf16>, vector<2xbf16>) -> vector<2xbf16>
+// LOCAL-LABEL: @reduce_minimum_bf16
+// LOCAL: llvm.intr.vector.reduce.fminimum(%{{.*}}) : (vector<8xbf16>) -> bf16
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
 tt.func private @reduce_minimum_bf16(%arg0: tensor<128x8xbf16, #blocked_packed_reduce>) -> tensor<128xbf16, #ttg.slice<{dim = 1, parent = #blocked_packed_reduce}>> {
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%a: bf16, %b: bf16):
@@ -317,10 +333,10 @@ tt.func private @packed_shuffle_minimum_bf16(%arg0: tensor<8x32xbf16, #packed_sh
   tt.return %0 : tensor<8xbf16, #ttg.slice<{dim = 1, parent = #packed_shuffle}>>
 }
 
-// TERNARY-LABEL: @reduce_maximum_f64
-// TERNARY: %[[F64_LEFT:.*]] = llvm.intr.maximum(%{{.*}}, %{{.*}}) : (f64, f64) -> f64
-// TERNARY-NEXT: %[[F64_RIGHT:.*]] = llvm.intr.maximum(%{{.*}}, %{{.*}}) : (f64, f64) -> f64
-// TERNARY-NEXT: llvm.intr.maximum(%[[F64_LEFT]], %[[F64_RIGHT]]) : (f64, f64) -> f64
+// LOCAL-LABEL: @reduce_maximum_f64
+// LOCAL: llvm.intr.vector.reduce.fmaximum(%{{.*}}) : (vector<4xf64>) -> f64
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
 tt.func private @reduce_maximum_f64(%arg0: tensor<128x4xf64, #blocked_reduce>) -> tensor<128xf64, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
   %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
   ^bb0(%a: f64, %b: f64):
@@ -838,4 +854,142 @@ tt.func private @reduce_broadcast_halves_minui_small(%arg0: tensor<8x4xi32, #hal
   tt.return %0 : tensor<8xi32, #ttg.slice<{dim = 1, parent = #halves}>>
 }
 
+
+// Full-width local reductions do not depend on packed arithmetic support.
+
+// LOCAL-LABEL: @reduce_local_muli
+// LOCAL: "llvm.intr.vector.reduce.mul"(%{{.*}}) : (vector<4xi64>) -> i64
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
+tt.func private @reduce_local_muli(%arg0: tensor<128x4xi64, #blocked_reduce>) -> tensor<128xi64, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
+  %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+  ^bb0(%a: i64, %b: i64):
+    %value = arith.muli %b, %a : i64
+    tt.reduce.return %value : i64
+  }) : (tensor<128x4xi64, #blocked_reduce>) -> tensor<128xi64, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+  tt.return %0 : tensor<128xi64, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+}
+
+// LOCAL-LABEL: @reduce_local_andi
+// LOCAL: "llvm.intr.vector.reduce.and"(%{{.*}}) : (vector<4xi32>) -> i32
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
+tt.func private @reduce_local_andi(%arg0: tensor<128x4xi32, #blocked_reduce>) -> tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
+  %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+  ^bb0(%a: i32, %b: i32):
+    %value = arith.andi %b, %a : i32
+    tt.reduce.return %value : i32
+  }) : (tensor<128x4xi32, #blocked_reduce>) -> tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+  tt.return %0 : tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+}
+
+// LOCAL-LABEL: @reduce_local_ori
+// LOCAL: "llvm.intr.vector.reduce.or"(%{{.*}}) : (vector<4xi32>) -> i32
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
+tt.func private @reduce_local_ori(%arg0: tensor<128x4xi32, #blocked_reduce>) -> tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
+  %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+  ^bb0(%a: i32, %b: i32):
+    %value = arith.ori %b, %a : i32
+    tt.reduce.return %value : i32
+  }) : (tensor<128x4xi32, #blocked_reduce>) -> tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+  tt.return %0 : tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+}
+
+// LOCAL-LABEL: @reduce_local_xori
+// LOCAL: "llvm.intr.vector.reduce.xor"(%{{.*}}) : (vector<4xi1>) -> i1
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
+tt.func private @reduce_local_xori(%arg0: tensor<128x4xi1, #blocked_reduce>) -> tensor<128xi1, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
+  %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+  ^bb0(%a: i1, %b: i1):
+    %value = arith.xori %b, %a : i1
+    tt.reduce.return %value : i1
+  }) : (tensor<128x4xi1, #blocked_reduce>) -> tensor<128xi1, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+  tt.return %0 : tensor<128xi1, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+}
+
+// LOCAL-LABEL: @reduce_local_minsi
+// LOCAL: "llvm.intr.vector.reduce.smin"(%{{.*}}) : (vector<4xi32>) -> i32
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
+tt.func private @reduce_local_minsi(%arg0: tensor<128x4xi32, #blocked_reduce>) -> tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
+  %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+  ^bb0(%a: i32, %b: i32):
+    %value = arith.minsi %b, %a : i32
+    tt.reduce.return %value : i32
+  }) : (tensor<128x4xi32, #blocked_reduce>) -> tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+  tt.return %0 : tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+}
+
+// LOCAL-LABEL: @reduce_local_maxui
+// LOCAL: "llvm.intr.vector.reduce.umax"(%{{.*}}) : (vector<4xi32>) -> i32
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
+tt.func private @reduce_local_maxui(%arg0: tensor<128x4xi32, #blocked_reduce>) -> tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
+  %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+  ^bb0(%a: i32, %b: i32):
+    %value = arith.maxui %b, %a : i32
+    tt.reduce.return %value : i32
+  }) : (tensor<128x4xi32, #blocked_reduce>) -> tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+  tt.return %0 : tensor<128xi32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+}
+
+// LOCAL-LABEL: @reduce_local_addf
+// LOCAL: llvm.mlir.constant(-0.000000e+00 : f32)
+// LOCAL: "llvm.intr.vector.reduce.fadd"(%{{.*}}, %{{.*}}) <{fastmathFlags = #llvm.fastmath<contract, reassoc>}> : (f32, vector<4xf32>) -> f32
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
+tt.func private @reduce_local_addf(%arg0: tensor<128x4xf32, #blocked_reduce>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
+  %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+  ^bb0(%a: f32, %b: f32):
+    %value = arith.addf %b, %a fastmath<contract> : f32
+    tt.reduce.return %value : f32
+  }) : (tensor<128x4xf32, #blocked_reduce>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+  tt.return %0 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+}
+
+// LOCAL-LABEL: @reduce_local_mulf
+// LOCAL: llvm.mlir.constant(1.000000e+00 : f32)
+// LOCAL: "llvm.intr.vector.reduce.fmul"(%{{.*}}, %{{.*}}) <{fastmathFlags = #llvm.fastmath<contract, reassoc>}> : (f32, vector<4xf32>) -> f32
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
+tt.func private @reduce_local_mulf(%arg0: tensor<128x4xf32, #blocked_reduce>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
+  %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+  ^bb0(%a: f32, %b: f32):
+    %value = arith.mulf %b, %a fastmath<contract> : f32
+    tt.reduce.return %value : f32
+  }) : (tensor<128x4xf32, #blocked_reduce>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+  tt.return %0 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+}
+
+// LOCAL-LABEL: @reduce_local_tuple
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.fadd
+// LOCAL: llvm.intr.maximum
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
+tt.func private @reduce_local_tuple(%arg0: tensor<128x4xf32, #blocked_reduce>, %arg1: tensor<128x4xf32, #blocked_reduce>) -> (tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>) {
+  %0:2 = "tt.reduce"(%arg0, %arg1) <{axis = 1 : i32}> ({
+  ^bb0(%a: f32, %b: f32, %c: f32, %d: f32):
+    %sum = arith.addf %a, %c : f32
+    %max = arith.maximumf %b, %d : f32
+    tt.reduce.return %sum, %max : f32, f32
+  }) : (tensor<128x4xf32, #blocked_reduce>, tensor<128x4xf32, #blocked_reduce>) -> (tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>)
+  tt.return %0#0, %0#1 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>, tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+}
+
+// LOCAL-LABEL: @reduce_local_custom
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL-COUNT-3: llvm.fsub
+// LOCAL-NOT: llvm.intr.vector.reduce
+// LOCAL: llvm.return
+tt.func private @reduce_local_custom(%arg0: tensor<128x4xf32, #blocked_reduce>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>> {
+  %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
+  ^bb0(%a: f32, %b: f32):
+    %value = arith.subf %a, %b : f32
+    tt.reduce.return %value : f32
+  }) : (tensor<128x4xf32, #blocked_reduce>) -> tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+  tt.return %0 : tensor<128xf32, #ttg.slice<{dim = 1, parent = #blocked_reduce}>>
+}
 }

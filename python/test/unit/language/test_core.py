@@ -3181,6 +3181,62 @@ def test_convert_float16_to_float32(in_dtype, device):
 # ---------------
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("op", ["add", "mul", "minnum", "maxnum", "minimum", "maximum"])
+def test_reduce_local_fp_special_values(device, dtype, op):
+    check_type_supported(str(dtype).removeprefix("torch."), device)
+
+    @triton.jit
+    def combine(a, b):
+        GENERATE_TEST_HERE
+
+    expr = {
+        "add": "a + b",
+        "mul": "a * b",
+        "minnum": "tl.minimum(a, b)",
+        "maxnum": "tl.maximum(a, b)",
+        "minimum": "tl.minimum(a, b, propagate_nan=tl.PropagateNan.ALL)",
+        "maximum": "tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)",
+    }[op]
+    combine = patch_kernel(combine, {"GENERATE_TEST_HERE": "return " + expr})
+
+    @triton.jit
+    def kernel(X, Y, N: tl.constexpr):
+        row = tl.program_id(0)
+        x = tl.load(X + row * N + tl.arange(0, N))
+        tl.store(Y + row, tl.reduce(x, 0, combine))
+
+    # Several values per thread, then warp and cross-warp reduction. No masks
+    # introduce identities that could hide the sign of an all-negative-zero sum.
+    n = 1024
+    x = torch.ones((6, n), device=device, dtype=dtype)
+    x[0, :] = -0.0
+    x[1, :] = 0.0
+    x[1, :n // 2] = -0.0
+    x[2, n // 2] = float("nan")
+    x[3, :] = float("nan")
+    x[4, 0], x[4, -1] = float("inf"), -float("inf")
+    x[5, 0] = -1.0
+    y = torch.empty((6, ), device=device, dtype=dtype)
+    kernel[(6, )](x, y, n, num_warps=4)
+
+    nan, inf = float("nan"), float("inf")
+    expected = {
+        "add": [-0.0, 0.0, nan, nan, nan, 1022.0],
+        "mul": [0.0, 0.0, nan, nan, -inf, -1.0],
+        "minnum": [-0.0, -0.0, 1.0, nan, -inf, -1.0],
+        "maxnum": [-0.0, 0.0, 1.0, nan, inf, 1.0],
+        "minimum": [-0.0, -0.0, nan, nan, -inf, -1.0],
+        "maximum": [-0.0, 0.0, nan, nan, inf, 1.0],
+    }[op]
+    reference = torch.tensor(expected, device=device, dtype=dtype)
+    torch.testing.assert_close(y, reference, rtol=0, atol=0, equal_nan=True)
+    # LLVM minnum/maxnum permit either sign when comparing -0.0 and +0.0.
+    if op not in ("minnum", "maxnum"):
+        zeros = reference == 0
+        torch.testing.assert_close(y[zeros].signbit(), reference[zeros].signbit())
+
+
 @pytest.mark.interpreter
 def test_max_returns_zero(device):
     # Simple test with a tl.max call that returns 0.  The interpreter had a bug
