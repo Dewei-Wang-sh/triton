@@ -1,0 +1,180 @@
+{
+  "triton_commit": "0492a1e548128dacb86529bca646a9fccf306483",
+  "aiter_commit": "9a5b187c66ab64c6feec30f218c134d2c617050e",
+  "kernel_source": "/home/dewwang/aiter/aiter/ops/triton/gluon/mla_gluon.py",
+  "triton_source": "/home/dewwang/triton/python/triton/__init__.py",
+  "gpu": "",
+  "visible_devices": "4",
+  "cache": "/home/dewwang/my_tools/vectorize_llvm/port_20261013/run/cache",
+  "compiled": {
+    "_mla_gluon": {
+      "hash": "dd521a247170e7cedd79929c7a3b6e3f838c500ecfd21eb71c16bc6d211b5a82",
+      "metadata": {
+        "AMDGCN_ENABLE_DUMP": "true",
+        "MLIR_ENABLE_DUMP": "_mla_gluon",
+        "allow_flush_denorm": true,
+        "allowed_dot_input_precisions": [
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "gfx950",
+        "backend_name": "hip",
+        "base_arch": "gfx950",
+        "debug": false,
+        "default_dot_input_precision": "ieee",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b8",
+          "fp8e5b16"
+        ],
+        "enable_fp_fusion": false,
+        "extern_libs": [
+          [
+            "ocml",
+            "/home/dewwang/triton/python/triton/backends/amd/lib/ocml.bc"
+          ],
+          [
+            "ockl",
+            "/home/dewwang/triton/python/triton/backends/amd/lib/ockl.bc"
+          ]
+        ],
+        "fpsan_homomorphic_casts": false,
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "dd521a247170e7cedd79929c7a3b6e3f838c500ecfd21eb71c16bc6d211b5a82",
+        "instrumentation_mode": "",
+        "kpack": 1,
+        "launch_cooperative_grid": false,
+        "llvm_fn_attrs": [],
+        "matrix_instr_nonkdim": 0,
+        "max_num_imprecise_acc_default": 0,
+        "name": "_mla_gluon",
+        "num_ctas": 1,
+        "num_stages": 2,
+        "num_warps": 4,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "sanitize_overflow": true,
+        "schedule_hint": "",
+        "shared": 152512,
+        "supported_fp8_dtypes": [
+          "fp8e4b8",
+          "fp8e4nv",
+          "fp8e5",
+          "fp8e5b16"
+        ],
+        "target": "GPUTarget(backend='hip', arch='gfx950', warp_size=64)",
+        "tensordesc_meta": [],
+        "triton_version": "3.9.0",
+        "warp_size": 64,
+        "waves_per_eu": 0,
+        "wgp_cu_mode": "wgp"
+      },
+      "grid": [
+        8,
+        1,
+        32
+      ],
+      "n_regs": 488,
+      "n_spills": 0
+    },
+    "_mla_softmax_reducev_kernel": {
+      "hash": "9d6c438791951befe65a5c37912961170b330c039dab94965dec6e7fc9c08d67",
+      "metadata": {
+        "AMDGCN_ENABLE_DUMP": "true",
+        "MLIR_ENABLE_DUMP": "_mla_gluon",
+        "allow_flush_denorm": true,
+        "allowed_dot_input_precisions": [
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "gfx950",
+        "backend_name": "hip",
+        "base_arch": "gfx950",
+        "debug": false,
+        "default_dot_input_precision": "ieee",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b8",
+          "fp8e5b16"
+        ],
+        "enable_fp_fusion": false,
+        "extern_libs": [
+          [
+            "ocml",
+            "/home/dewwang/triton/python/triton/backends/amd/lib/ocml.bc"
+          ],
+          [
+            "ockl",
+            "/home/dewwang/triton/python/triton/backends/amd/lib/ockl.bc"
+          ]
+        ],
+        "fpsan_homomorphic_casts": false,
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "9d6c438791951befe65a5c37912961170b330c039dab94965dec6e7fc9c08d67",
+        "instrumentation_mode": "",
+        "kpack": 1,
+        "launch_cooperative_grid": false,
+        "llvm_fn_attrs": [],
+        "matrix_instr_nonkdim": 0,
+        "max_num_imprecise_acc_default": 0,
+        "name": "_mla_softmax_reducev_kernel",
+        "num_ctas": 1,
+        "num_stages": 2,
+        "num_warps": 8,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "sanitize_overflow": true,
+        "schedule_hint": "",
+        "shared": 4096,
+        "supported_fp8_dtypes": [
+          "fp8e4b8",
+          "fp8e4nv",
+          "fp8e5",
+          "fp8e5b16"
+        ],
+        "target": "GPUTarget(backend='hip', arch='gfx950', warp_size=64)",
+        "tensordesc_meta": [],
+        "triton_version": "3.9.0",
+        "warp_size": 64,
+        "waves_per_eu": 0,
+        "wgp_cu_mode": "wgp"
+      },
+      "grid": [
+        128,
+        64,
+        1
+      ],
+      "n_regs": 14,
+      "n_spills": 0
+    }
+  },
+  "replay_mlir": "/home/dewwang/my_tools/vectorize_llvm/port_20261013/mla.vectorized.04-wide.mlir",
+  "replay_count": 1,
+  "workload": {
+    "batch": 128,
+    "heads": 64,
+    "context": 1024,
+    "seed": 123,
+    "dtype": "bf16",
+    "q_stride": [
+      36864,
+      576,
+      1
+    ],
+    "kv_stride": [
+      576,
+      1
+    ],
+    "page_mapping": "random permutation"
+  },
+  "correctness": {
+    "passed": true,
+    "reference": "FP32 PyTorch attention",
+    "atol": 0.01,
+    "rtol": 0.01,
+    "max_abs": 0.002318739891052246,
+    "rms": 0.00016516253390689022
+  }
+}

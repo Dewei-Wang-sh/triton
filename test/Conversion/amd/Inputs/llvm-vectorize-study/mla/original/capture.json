@@ -1,0 +1,205 @@
+{
+  "triton_commit": "21e1b37d82fe010550b2fb3f08c8e600f73ae355",
+  "aiter_commit": "9a5b187c66ab64c6feec30f218c134d2c617050e",
+  "kernel_source": "/home/dewwang/aiter/aiter/ops/triton/gluon/mla_gluon.py",
+  "triton_source": "/home/dewwang/triton/python/triton/__init__.py",
+  "gpu": "",
+  "visible_devices": "1",
+  "cache": "/home/dewwang/my_tools/vectorize_llvm/experiments/port_20261013/triton_cache",
+  "compiled": {
+    "_mla_gluon": {
+      "hash": "0ea785912b84b2ba497fbd90400b7abc099a8fc4edafc1c23482812413e152dd",
+      "metadata": {
+        "AMDGCN_ENABLE_DUMP": "true",
+        "MLIR_ENABLE_DUMP": "_mla_gluon",
+        "allow_flush_denorm": false,
+        "allowed_dot_input_precisions": [
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "gfx950",
+        "backend_name": "hip",
+        "base_arch": "gfx950",
+        "debug": false,
+        "default_dot_input_precision": "ieee",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b8",
+          "fp8e5b16"
+        ],
+        "enable_fp_fusion": false,
+        "extern_libs": [
+          [
+            "ocml",
+            "/home/dewwang/triton/python/triton/backends/amd/lib/ocml.bc"
+          ],
+          [
+            "ockl",
+            "/home/dewwang/triton/python/triton/backends/amd/lib/ockl.bc"
+          ]
+        ],
+        "fpsan_homomorphic_casts": false,
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "0ea785912b84b2ba497fbd90400b7abc099a8fc4edafc1c23482812413e152dd",
+        "instrumentation_mode": "",
+        "kpack": 1,
+        "launch_cooperative_grid": false,
+        "llvm_fn_attrs": [],
+        "matrix_instr_nonkdim": 0,
+        "max_num_imprecise_acc_default": 0,
+        "name": "_mla_gluon",
+        "num_ctas": 1,
+        "num_stages": 2,
+        "num_warps": 4,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "sanitize_overflow": true,
+        "schedule_hint": "",
+        "shared": 152512,
+        "supported_fp8_dtypes": [
+          "fp8e4b8",
+          "fp8e4nv",
+          "fp8e5",
+          "fp8e5b16"
+        ],
+        "target": "GPUTarget(backend='hip', arch='gfx950', warp_size=64)",
+        "tensordesc_meta": [],
+        "triton_version": "3.9.0",
+        "warp_size": 64,
+        "waves_per_eu": 0,
+        "wgp_cu_mode": "wgp"
+      },
+      "grid": [
+        8,
+        1,
+        32
+      ],
+      "n_regs": 481,
+      "n_spills": 0
+    },
+    "_mla_softmax_reducev_kernel": {
+      "hash": "7e132718b116c6e5740b56d155b93d0dc3aca2b477d558dbd491f99ce57e8539",
+      "metadata": {
+        "AMDGCN_ENABLE_DUMP": "true",
+        "MLIR_ENABLE_DUMP": "_mla_gluon",
+        "allow_flush_denorm": false,
+        "allowed_dot_input_precisions": [
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "gfx950",
+        "backend_name": "hip",
+        "base_arch": "gfx950",
+        "debug": false,
+        "default_dot_input_precision": "ieee",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b8",
+          "fp8e5b16"
+        ],
+        "enable_fp_fusion": false,
+        "extern_libs": [
+          [
+            "ocml",
+            "/home/dewwang/triton/python/triton/backends/amd/lib/ocml.bc"
+          ],
+          [
+            "ockl",
+            "/home/dewwang/triton/python/triton/backends/amd/lib/ockl.bc"
+          ]
+        ],
+        "fpsan_homomorphic_casts": false,
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "7e132718b116c6e5740b56d155b93d0dc3aca2b477d558dbd491f99ce57e8539",
+        "instrumentation_mode": "",
+        "kpack": 1,
+        "launch_cooperative_grid": false,
+        "llvm_fn_attrs": [],
+        "matrix_instr_nonkdim": 0,
+        "max_num_imprecise_acc_default": 0,
+        "name": "_mla_softmax_reducev_kernel",
+        "num_ctas": 1,
+        "num_stages": 2,
+        "num_warps": 8,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "sanitize_overflow": true,
+        "schedule_hint": "",
+        "shared": 4096,
+        "supported_fp8_dtypes": [
+          "fp8e4b8",
+          "fp8e4nv",
+          "fp8e5",
+          "fp8e5b16"
+        ],
+        "target": "GPUTarget(backend='hip', arch='gfx950', warp_size=64)",
+        "tensordesc_meta": [],
+        "triton_version": "3.9.0",
+        "warp_size": 64,
+        "waves_per_eu": 0,
+        "wgp_cu_mode": "wgp"
+      },
+      "grid": [
+        128,
+        64,
+        1
+      ],
+      "n_regs": 16,
+      "n_spills": 0
+    }
+  },
+  "workload": {
+    "batch": 128,
+    "heads": 64,
+    "context": 1024,
+    "seed": 123,
+    "dtype": "bf16",
+    "q_stride": [
+      36864,
+      576,
+      1
+    ],
+    "kv_stride": [
+      576,
+      1
+    ],
+    "page_mapping": "random permutation"
+  },
+  "correctness": {
+    "passed": true,
+    "reference": "FP32 PyTorch attention",
+    "atol": 0.01,
+    "rtol": 0.01,
+    "max_abs": 0.002318739891052246,
+    "rms": 0.00016516199177647013
+  },
+  "ir_boundary": {
+    "previous_dump": "// -----// IR Dump Before SymbolDCEPass: symbol-dce ('builtin.module' operation) //----- //",
+    "input_dump": "// -----// IR Dump Before LLVMDIScope: enable-line-info ('builtin.module' operation) //----- //",
+    "next_dump": "// -----// IR Dump Before ConvertBuiltinFuncToLLVM: convert-builtin-func-to-llvm{ftz=true gfx-arch=gfx950} ('builtin.module' operation) //----- //",
+    "file": "mla.after.SymbolDCE.mlir",
+    "lines": 23587
+  },
+  "ir_operation_counts": {
+    "llvm.fadd": 34,
+    "llvm.fmul": 743,
+    "llvm.fsub": 51,
+    "llvm.select": 232,
+    "llvm.br": 3,
+    "llvm.cond_br": 3,
+    "llvm.extractvalue": 462,
+    "llvm.insertvalue": 390,
+    "llvm.extractelement": 7918,
+    "llvm.insertelement": 8286,
+    "rocdl.exp2": 51,
+    "builtin.unrealized_conversion_cast": 0
+  },
+  "standalone_replay": {
+    "exit_code": 1,
+    "passed": false,
+    "log": "mla.vectorize.log",
+    "reason": "Unresolved target materialization from intrinsic result struct<(i32, i32)> to vector<2xi32>; first occurrence is llvm.amdgcn.permlane32.swap in the row-max reduction."
+  }
+}

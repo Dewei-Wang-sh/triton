@@ -1,0 +1,3 @@
+# Preserve archived compiler output byte-for-byte, including printer whitespace.
+original/** -whitespace
+after/** -whitespace
