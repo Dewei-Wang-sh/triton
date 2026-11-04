@@ -82,13 +82,9 @@ Type TritonGPUToLLVMTypeConverter::convertMemDescType(
 
   SmallVector<Type, 4> types;
 
-  // Determine number of base pointers based on encoding.
-  // For partitioned tensors, we need one base pointer per partition.
-  size_t numBases = 1;
-  if (auto partitioned = dyn_cast<triton::gpu::PartitionedSharedEncodingAttr>(
-          type.getEncoding())) {
-    numBases = partitioned.getNumPartitions();
-  }
+  // One base pointer per partition (partitioned_shared, or a shared_linear
+  // view of a partitioned buffer).
+  size_t numBases = triton::gpu::getNumSharedPartitions(type.getEncoding());
 
   // Add base pointer(s)
   for (size_t i = 0; i < numBases; ++i) {

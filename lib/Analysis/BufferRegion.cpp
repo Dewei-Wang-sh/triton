@@ -234,9 +234,7 @@ uint32_t getMemDescStorageOffset(ttg::MemDescType ty, unsigned index) {
     return index * ttng::getTmemAllocSizes(ty).numCols;
   uint32_t elems = ttg::getAllocationElems(ty.getEncoding(), ty.getShape(),
                                            ty.getAllocShape());
-  if (auto partitioned =
-          dyn_cast<ttg::PartitionedSharedEncodingAttr>(ty.getEncoding()))
-    elems /= partitioned.getNumPartitions();
+  elems /= ttg::getNumSharedPartitions(ty.getEncoding());
   uint32_t elementSize = getIntOrFloatOrPtrBitWidth(ty.getElementType()) / 8;
   return applySharedPadding(index * elems * elementSize, ty);
 }
@@ -284,9 +282,7 @@ getMemDescSubsliceUnpaddedOffsets(ttg::MemDescType srcTy,
   if (offsets.size() != layoutRank) {
     uint32_t stride = ttg::getAllocationElems(
         encoding, ttg::dropPipeliningDim(srcTy.getAllocShape(), encoding));
-    if (auto partitioned =
-            dyn_cast<ttg::PartitionedSharedEncodingAttr>(encoding))
-      stride /= partitioned.getNumPartitions();
+    stride /= ttg::getNumSharedPartitions(encoding);
     // The pipeline prefix advances every base pointer by addition. Only the
     // layout-ranked suffix composes by XOR; nested prefix offsets may carry.
     // Padded pipeline subslices are rejected by the verifier.

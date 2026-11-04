@@ -254,9 +254,11 @@ py::object layoutToGluon(Attribute layout, bool isRubin = false) {
     auto ctx = layout.getContext();
     auto kOffset = mlir::StringAttr::get(ctx, "offset");
     auto kBlock = mlir::StringAttr::get(ctx, "block");
+    auto kPartition = mlir::StringAttr::get(ctx, "partition");
     return getLayoutClass("SharedLinearLayout")(
         toStdVector(ll.getBases().lookup(kOffset)),
-        toStdVector(ll.getBases().lookup(kBlock)), sharedLl.getAlignment());
+        toStdVector(ll.getBases().lookup(kBlock)), sharedLl.getAlignment(),
+        toStdVector(ll.getBases().lookup(kPartition)));
   } else if (auto autoEnc = dyn_cast<gluon::AutoEncodingAttr>(layout)) {
     return getLayoutClass("AutoLayout")();
   } else if (auto autoEnc = dyn_cast<gluon::CoalescedEncodingAttr>(layout)) {
@@ -603,14 +605,18 @@ void init_gluon_ir(py::module_ &m) {
            })
       .def("get_shared_linear_layout",
            [](GluonOpBuilder &self, std::vector<std::vector<int>> &offsetBases,
-              std::vector<std::vector<int>> &blockBases,
-              unsigned alignment) -> Attribute {
+              std::vector<std::vector<int>> &blockBases, unsigned alignment,
+              std::vector<std::vector<int>> &partitionBases) -> Attribute {
              auto ctx = self.getContext();
              auto kOffset = mlir::StringAttr::get(ctx, "offset");
              auto kBlock = mlir::StringAttr::get(ctx, "block");
              auto outDims = tt::standardOutDimNames(ctx, offsetBases[0].size());
-             auto ll = tt::LinearLayout(
-                 {{kOffset, offsetBases}, {kBlock, blockBases}}, outDims);
+             tt::LinearLayout::BasesT bases;
+             bases[kOffset] = offsetBases;
+             bases[kBlock] = blockBases;
+             if (!partitionBases.empty())
+               bases[mlir::StringAttr::get(ctx, "partition")] = partitionBases;
+             auto ll = tt::LinearLayout(std::move(bases), outDims);
              return self.getChecked<ttg::SharedLinearEncodingAttr>(
                  ctx, std::move(ll), alignment);
            })

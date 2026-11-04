@@ -371,8 +371,7 @@ public:
     auto memDescTy = cast<MemDescType>(op.getSrc().getType());
     // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
     // PRs.
-    if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
-            memDescTy.getEncoding())) {
+    if (triton::gpu::getNumSharedPartitions(memDescTy.getEncoding()) > 1) {
       return rewriter.notifyMatchFailure(
           op, "PartitionedSharedEncoding not yet supported in lowering");
     }
@@ -420,8 +419,7 @@ public:
     auto memDescTy = cast<MemDescType>(op.getDst().getType());
     // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
     // PRs.
-    if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
-            memDescTy.getEncoding())) {
+    if (triton::gpu::getNumSharedPartitions(memDescTy.getEncoding()) > 1) {
       return rewriter.notifyMatchFailure(
           op, "PartitionedSharedEncoding not yet supported in lowering");
     }

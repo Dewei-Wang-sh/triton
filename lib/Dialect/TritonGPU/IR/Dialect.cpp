@@ -1995,8 +1995,13 @@ SharedLinearEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   if (layoutAlignment == 0 || !llvm::isPowerOf2_32(layoutAlignment)) {
     return emitError() << "alignment must be a positive power of two";
   }
+  // "partition" (optional) describes a view of a partitioned buffer: the
+  // address is base[partition] + offset.
   static const auto expectedInDims =
-      SmallVector<std::string>({"offset", "block"});
+      SmallVector<std::string>({"offset", "block", "partition"});
+  if (linearLayout.getNumInDims() > expectedInDims.size())
+    return emitError() << "Expected input dimensions 'offset', 'block' and "
+                          "optionally 'partition'";
   for (const auto &[index, dims] : llvm::enumerate(
            llvm::zip(linearLayout.getInDimNames(), expectedInDims))) {
     const auto &[dim, expected] = dims;
@@ -2046,10 +2051,13 @@ void SharedLinearEncodingAttr::print(AsmPrinter &printer) const {
   auto layout = getLinearLayout();
   auto kBlock = StringAttr::get(getContext(), "block");
   auto kOffset = StringAttr::get(getContext(), "offset");
-  if (layout.getBases().lookup(kBlock).empty()) {
-    layout =
-        layout.sublayout({kOffset}, llvm::to_vector(layout.getOutDimNames()));
-  }
+  auto kPartition = StringAttr::get(getContext(), "partition");
+  SmallVector<StringAttr> inDims = {kOffset};
+  if (!layout.getBases().lookup(kBlock).empty())
+    inDims.push_back(kBlock);
+  if (layout.hasInDim(kPartition))
+    inDims.push_back(kPartition);
+  layout = layout.sublayout(inDims, llvm::to_vector(layout.getOutDimNames()));
   printLinearLayout(printer, layout);
   printer << "}, alignment = " << getAlignment() << ">";
 }
@@ -2090,6 +2098,8 @@ Attribute SharedLinearEncodingAttr::parse(AsmParser &parser, Type type) {
     return {};
 
   std::vector<std::string> inDimNames = {"offset", "block"};
+  if (layoutDict.get("partition"))
+    inDimNames.push_back("partition");
   auto maybeLL = parseLinearLayout(layoutDict, parser, inDimNames);
   if (!maybeLL.has_value())
     return {};
@@ -2101,10 +2111,10 @@ Attribute SharedLinearEncodingAttr::parse(AsmParser &parser, Type type) {
     return {};
   }
 
-  if (layoutDict.size() != 2) {
+  if (layoutDict.size() != inDimNames.size()) {
     parser.emitError(parser.getCurrentLocation())
-        << "SharedLinearEncodingAttr must have exactly two attributes: offset "
-           "and block";
+        << "SharedLinearEncodingAttr only takes the attributes offset, block "
+           "and partition";
     return {};
   }
 
@@ -4836,4 +4846,15 @@ unsigned triton::gpu::getMinInterval(Attribute encoding) {
   auto padded = getPaddedEncoding(encoding);
   assert(padded && "expected padded encoding or partitioned wrapping padded");
   return padded.getMinInterval();
+}
+
+unsigned triton::gpu::getNumSharedPartitions(Attribute encoding) {
+  if (auto partitioned = dyn_cast_or_null<PartitionedSharedEncodingAttr>(encoding))
+    return partitioned.getNumPartitions();
+  if (auto linear = dyn_cast_or_null<SharedLinearEncodingAttr>(encoding)) {
+    auto kPartition = StringAttr::get(linear.getContext(), "partition");
+    const auto &ll = linear.getLinearLayout();
+    return ll.hasInDim(kPartition) ? ll.getInDimSize(kPartition) : 1;
+  }
+  return 1;
 }

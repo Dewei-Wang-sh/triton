@@ -1139,3 +1139,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A partitioned shared_linear layout only describes views; buffers are
+// allocated with partitioned_shared.
+#view = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [0, 4], [0, 8], [1, 0], [2, 0], [4, 0]], partition = [[8, 0]]}, alignment = 16>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @local_alloc_partitioned_shared_linear() {
+    // expected-error @below {{cannot allocate a partitioned shared_linear layout; use partitioned_shared}}
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<16x16xf16, #view, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// The parser reports the error at the token after the attribute.
+// expected-error @+2 {{SharedLinearEncodingAttr only takes the attributes offset, block and partition}}
+#bad = #ttg.shared_linear<{offset = [[0, 1]], group = [[1, 0]]}, alignment = 16>
+module {}

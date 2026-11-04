@@ -258,3 +258,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+// local_load through a reshaped view of a partitioned buffer: the view is a
+// shared_linear layout with a partition input and keeps both base pointers.
+#blocked = #ttg.blocked<{sizePerThread = [1, 1, 8], threadsPerWarp = [1, 4, 8], warpsPerCTA = [2, 1, 1], order = [2, 1, 0]}>
+#inner = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#rows = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #inner}>
+#rows3 = #ttg.shared_linear<{offset = [[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 0, 16], [0, 0, 32], [0, 1, 0], [0, 2, 0], [0, 4, 0]], partition = [[1, 0, 0]]}, alignment = 16>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // COMMON-LABEL: partitioned_shared_reshape_view_local_load
+  tt.func @partitioned_shared_reshape_view_local_load() -> tensor<2x8x64xf16, #blocked> {
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<16x64xf16, #rows, #smem, mutable>
+    %1 = ttg.memdesc_reshape %0 : !ttg.memdesc<16x64xf16, #rows, #smem, mutable> -> !ttg.memdesc<2x8x64xf16, #rows3, #smem, mutable>
+    // COMMON: llvm.extractelement {{.*}} : vector<2x!llvm.ptr<3>>
+    // COMMON: llvm.load {{.*}} : !llvm.ptr<3> -> vector<8xf16>
+    %2 = ttg.local_load %1 : !ttg.memdesc<2x8x64xf16, #rows3, #smem, mutable> -> tensor<2x8x64xf16, #blocked>
+    tt.return %2 : tensor<2x8x64xf16, #blocked>
+  }
+}

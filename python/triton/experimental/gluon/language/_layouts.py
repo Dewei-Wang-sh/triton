@@ -629,38 +629,46 @@ class PaddedSharedLayout(SharedLayout):
 
 @dataclass(frozen=True)
 class SharedLinearLayout(SharedLayout):
-    """Represents a shared memory layout defined via an explicit LinearLayout."""
+    """Represents a shared memory layout defined via an explicit LinearLayout.
+
+    `partition_bases` (optional) describes a view of a partitioned buffer: the
+    address of an element is base[partition] + offset.
+    """
 
     offset_bases: List[List[int]]
     block_bases: List[List[int]] = field(default_factory=list)
     alignment: int = 16
+    partition_bases: List[List[int]] = field(default_factory=list)
 
     def __post_init__(self):
         super().__setattr__("offset_bases", _unwrap_shape(self.offset_bases))
         super().__setattr__("block_bases", _unwrap_shape(self.block_bases))
         super().__setattr__("alignment", _unwrap_if_constexpr(self.alignment))
+        super().__setattr__("partition_bases", _unwrap_shape(self.partition_bases))
 
         assert len(self.offset_bases) != 0, "SharedLinearLayout offset_bases must not be empty"
         rank = len(self.offset_bases[0])
         assert rank > 0, "SharedLinearLayout offset_bases must not be empty"
         for basis in self.offset_bases:
             assert len(basis) == rank
-        for basis in self.block_bases:
+        for basis in itertools.chain(self.block_bases, self.partition_bases):
             assert len(basis) == rank
         assert self.alignment > 0 and (self.alignment & (self.alignment - 1)) == 0, \
             "SharedLinearLayout alignment must be a positive power of two"
 
     def _to_ir(self, builder):
-        return builder.get_shared_linear_layout(self.offset_bases, self.block_bases, self.alignment)
+        return builder.get_shared_linear_layout(self.offset_bases, self.block_bases, self.alignment,
+                                                self.partition_bases)
 
     def mangle(self) -> str:
-        return f"SharedLinear_{self.offset_bases}_{self.block_bases}_{self.alignment}_SharedLinear"
+        return (f"SharedLinear_{self.offset_bases}_{self.block_bases}_{self.alignment}_"
+                f"{self.partition_bases}_SharedLinear")
 
     @property
     def shape(self):
         rank = len(self.offset_bases[0])
         max_stride = [0] * rank
-        for b in itertools.chain(self.offset_bases, self.block_bases):
+        for b in itertools.chain(self.offset_bases, self.block_bases, self.partition_bases):
             for i, bi in enumerate(b):
                 max_stride[i] = max(max_stride[i], bi)
         return [1 << s.bit_length() for s in max_stride]
@@ -670,6 +678,7 @@ class SharedLinearLayout(SharedLayout):
             tuple(map(tuple, self.offset_bases)),
             tuple(map(tuple, self.block_bases)),
             self.alignment,
+            tuple(map(tuple, self.partition_bases)),
         ))
 
 

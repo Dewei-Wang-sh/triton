@@ -720,8 +720,7 @@ FailureOr<LocalAtomicScatterRMWInfo> prepareLocalAtomicScatterRMW(
   auto *ctx = op.getContext();
   auto valuesTy = cast<RankedTensorType>(op.getValues().getType());
   auto memDescTy = cast<triton::gpu::MemDescType>(op.getDst().getType());
-  if (isa<triton::gpu::PartitionedSharedEncodingAttr>(
-          memDescTy.getEncoding())) {
+  if (triton::gpu::getNumSharedPartitions(memDescTy.getEncoding()) > 1) {
     return failure();
   }
 

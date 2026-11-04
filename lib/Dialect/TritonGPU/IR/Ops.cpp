@@ -704,8 +704,7 @@ LogicalResult MemDescReinterpretOp::verify() {
     return dropPipeliningDim(ty.getShape(), encoding) !=
            dropPipeliningDim(ty.getAllocShape(), encoding);
   };
-  if (isa<PartitionedSharedEncodingAttr>(srcEnc) ||
-      isa<PartitionedSharedEncodingAttr>(dstEnc))
+  if (getNumSharedPartitions(srcEnc) > 1 || getNumSharedPartitions(dstEnc) > 1)
     return emitError("cannot reinterpret partitioned shared layouts");
 
   if (isPaddedEncoding(srcEnc) != isPaddedEncoding(dstEnc))
@@ -953,6 +952,12 @@ static LogicalResult verifySharedMemoryRank(Operation *op,
 LogicalResult LocalAllocOp::verify() {
   if (!isa<SharedMemorySpaceAttr>(getType().getMemorySpace()))
     return emitOpError("should create a buffer of shared memory");
+  // A partitioned shared_linear layout describes views of a partitioned
+  // buffer; the buffer itself is allocated with partitioned_shared.
+  if (isa_and_nonnull<SharedLinearEncodingAttr>(getType().getEncoding()) &&
+      getNumSharedPartitions(getType().getEncoding()) > 1)
+    return emitOpError("cannot allocate a partitioned shared_linear layout; "
+                       "use partitioned_shared");
   if (getSrc() && failed(verifySharedMemoryRank(*this, getSrc().getType(),
                                                 getType(), "source")))
     return failure();

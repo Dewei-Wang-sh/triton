@@ -539,3 +539,21 @@ module attributes {"ttg.target" = "hip:gfx1260", "ttg.num-ctas" = 1 : i32, "ttg.
     tt.return
   }
 }
+
+// -----
+
+// A shared_linear layout with a partition input describes a view of a
+// partitioned buffer; reshaping a partitioned_shared buffer produces one.
+#inner = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#rows = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #inner}>
+#rows3 = #ttg.shared_linear<{offset = [[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 0, 16], [0, 0, 32], [0, 1, 0], [0, 2, 0], [0, 4, 0]], partition = [[1, 0, 0]]}, alignment = 16>
+#smem = #ttg.shared_memory
+// CHECK: #[[$ROWS3:.*]] = #ttg.shared_linear<{offset = {{\[\[}}0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [0, 0, 16], [0, 0, 32], [0, 1, 0], [0, 2, 0], [0, 4, 0]], partition = {{\[\[}}1, 0, 0]]}, alignment = 16>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: memdesc_reshape_partitioned_to_shared_linear
+  // CHECK: ttg.memdesc_reshape {{.*}} -> !ttg.memdesc<2x8x64xf16, #[[$ROWS3]], #smem, mutable>
+  tt.func @memdesc_reshape_partitioned_to_shared_linear(%d: !ttg.memdesc<16x64xf16, #rows, #smem, mutable>) {
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<16x64xf16, #rows, #smem, mutable> -> !ttg.memdesc<2x8x64xf16, #rows3, #smem, mutable>
+    tt.return
+  }
+}

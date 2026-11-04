@@ -445,6 +445,11 @@ bool isPaddedEncoding(Attribute encoding);
 // wrapped in partitioned).
 unsigned getMinInterval(Attribute encoding);
 
+// Number of shared-memory base pointers (physical partitions) of a shared
+// encoding: numPartitions of a partitioned_shared encoding, the size of the
+// "partition" input of a shared_linear one, and 1 otherwise.
+unsigned getNumSharedPartitions(Attribute encoding);
+
 } // namespace mlir::triton::gpu
 
 namespace llvm {

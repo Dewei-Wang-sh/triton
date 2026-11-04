@@ -405,10 +405,7 @@ struct MemDescIndexOpConversion
     // account for this.
     int64_t stride =
         getAllocationElems(dstTy.getEncoding(), dstTy.getAllocShape());
-    if (auto partEnc =
-            dyn_cast<PartitionedSharedEncodingAttr>(dstTy.getEncoding())) {
-      stride /= partEnc.getNumPartitions();
-    }
+    stride /= getNumSharedPartitions(dstTy.getEncoding());
     Value offset = b.mul(op.getIndex(), b.i32_val(stride));
     auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                    llvmElemTy, rewriter);
@@ -467,8 +464,7 @@ struct MemDescSubsliceOpConversion
         opOffsetVals.front() != 0) {
       int64_t stride = getAllocationElems(
           encoding, dropPipeliningDim(srcTy.getAllocShape(), encoding));
-      if (auto partEnc = dyn_cast<PartitionedSharedEncodingAttr>(encoding))
-        stride /= partEnc.getNumPartitions();
+      stride /= getNumSharedPartitions(encoding);
       Value offset = b.i32_val(opOffsetVals.front() * stride);
       for (Value &base : newBases)
         base = b.gep(base.getType(), llvmElemTy, base, offset);
@@ -484,6 +480,10 @@ struct MemDescSubsliceOpConversion
     // Partition pieces repeat independently within each CTA, with partitions
     // varying faster than groups. The logical piece selected by the static
     // offset therefore determines the physical base rotation directly.
+    if (!isa<PartitionedSharedEncodingAttr>(encoding) &&
+        getNumSharedPartitions(encoding) > 1)
+      return rewriter.notifyMatchFailure(
+          op, "subslice of a partitioned shared_linear view is not supported");
     if (auto part = dyn_cast<PartitionedSharedEncodingAttr>(encoding)) {
       auto allocShape = dropPipeliningDim(srcTy.getAllocShape(), encoding);
       auto shapePerCTA = getShapePerCTA(part, allocShape);
@@ -517,8 +517,8 @@ struct MemDescReinterpretOpConversion
     Type srcElemTy = getTypeConverter()->convertType(srcTy.getElementType());
     Type dstElemTy = getTypeConverter()->convertType(dstTy.getElementType());
 
-    // PartitionedSharedEncoding is not yet supported for memdesc_reinterpret
-    if (isa<PartitionedSharedEncodingAttr>(srcTy.getEncoding())) {
+    // Partitioned layouts are not yet supported for memdesc_reinterpret
+    if (getNumSharedPartitions(srcTy.getEncoding()) > 1) {
       return b.notifyMatchFailure(
           op,
           "PartitionedSharedEncoding not yet supported in memdesc_reinterpret");
