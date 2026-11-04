@@ -1139,3 +1139,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// A flat view of a column-partitioned buffer interleaves the two partitions
+// (groups of 32 elements alternate), which a partitioned layout with the
+// source's numGroups cannot express.
+#inner = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#cols = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 1, partitionLayout = #inner}>
+#flat = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @memdesc_reshape_partitioned_flat(%d: !ttg.memdesc<2x64xf16, #cols, #smem, mutable>) {
+    // expected-error @below {{cannot express the shared encoding of the reshaped memdesc}}
+    %0 = ttg.memdesc_reshape %d : !ttg.memdesc<2x64xf16, #cols, #smem, mutable> -> !ttg.memdesc<128xf16, #flat, #smem, mutable>
+    tt.return
+  }
+}

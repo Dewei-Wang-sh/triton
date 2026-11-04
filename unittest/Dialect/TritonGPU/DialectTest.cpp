@@ -560,6 +560,55 @@ TEST_F(LinearEncodingTest, DistributedEncodingToLinearEncoding) {
     }
   }
 }
+class MemDescReshapeTest : public ::testing::Test {
+public:
+  MemDescReshapeTest() { ctx.getOrLoadDialect<TritonGPUDialect>(); }
+
+protected:
+  // Reshapes a memdesc of type `srcTyStr` to `dstShape` through the op's type
+  // inference and checks that the result is partitioned along `partitionDim`
+  // and keeps the reshaped linear layout, partition input included.
+  void checkPartitionedReshape(StringRef srcTyStr, ArrayRef<int64_t> dstShape,
+                               unsigned partitionDim) {
+    auto srcTy = dyn_cast_or_null<MemDescType>(parseType(srcTyStr, &ctx));
+    ASSERT_TRUE(srcTy) << "could not parse " << srcTyStr.str();
+    MemDescType dstTy;
+    ASSERT_TRUE(succeeded(MemDescReshapeOp::inferReturnTypes(
+        &ctx, std::nullopt, srcTy, dstShape, dstTy)));
+    auto dstEnc = dyn_cast<PartitionedSharedEncodingAttr>(dstTy.getEncoding());
+    std::string dstTyStr;
+    llvm::raw_string_ostream(dstTyStr) << dstTy;
+    ASSERT_TRUE(dstEnc) << "partition dropped by reshape: " << dstTyStr;
+    EXPECT_EQ(dstEnc.getPartitionDim(), partitionDim);
+    EXPECT_EQ(toLinearLayout(dstShape, dstEnc),
+              reshapeLayout(&ctx,
+                            toLinearLayout(srcTy.getShape(),
+                                           srcTy.getEncoding()),
+                            dstShape));
+  }
+
+  MLIRContext ctx;
+};
+
+constexpr const char *kPartitionedRows =
+    "!ttg.memdesc<16x64xf16, #ttg.partitioned_shared<{numPartitions = 2, "
+    "numGroups = 1, partitionDim = 0, partitionLayout = "
+    "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, "
+    "0]}>}>, #ttg.shared_memory, mutable>";
+constexpr const char *kPartitionedCols =
+    "!ttg.memdesc<4x64xf16, #ttg.partitioned_shared<{numPartitions = 2, "
+    "numGroups = 1, partitionDim = 1, partitionLayout = "
+    "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, "
+    "0]}>}>, #ttg.shared_memory, mutable>";
+
+TEST_F(MemDescReshapeTest, PartitionedRowsToLeadingDim) {
+  checkPartitionedReshape(kPartitionedRows, {2, 8, 64}, /*partitionDim=*/0);
+}
+
+TEST_F(MemDescReshapeTest, PartitionedColsToMiddleDim) {
+  checkPartitionedReshape(kPartitionedCols, {4, 2, 32}, /*partitionDim=*/1);
+}
+
 } // namespace
 } // namespace mlir::triton::gpu
 

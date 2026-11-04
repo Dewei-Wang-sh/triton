@@ -649,6 +649,61 @@ static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
     }
     dstEnc = PaddedSharedEncodingAttr::get(ctx, intervalPads, std::move(dst));
     return success();
+  } else if (auto partitioned =
+                 dyn_cast<PartitionedSharedEncodingAttr>(srcEnc)) {
+    // The generic path below wraps the reshaped layout in a shared_linear
+    // encoding, which has no "partition" input, so the partition would be
+    // silently dropped. Instead rebuild a partitioned encoding: find a dst dim
+    // d such that one piece (d split by the number of pieces) holds every
+    // offset and block basis, and keep it only if it reproduces the reshaped
+    // layout exactly.
+    auto kOffset = StringAttr::get(ctx, "offset");
+    auto kBlock = StringAttr::get(ctx, "block");
+    auto dstLL = reshapeLayout(ctx, toLinearLayout(srcShape, srcEnc), dstShape);
+    unsigned numPieces = partitioned.getNumLogicalPieces();
+    // The group bits are the last offset bases (see
+    // partitionedSharedToLinearLayout); the ones before them form one piece.
+    auto offsetBases = dstLL.getBases().lookup(kOffset);
+    offsetBases.resize(offsetBases.size() -
+                       llvm::Log2_32(partitioned.getNumGroups()));
+    auto blockBases = dstLL.getBases().lookup(kBlock);
+    auto outDimNames = standardOutDimNames(ctx, dstShape.size());
+    auto alignment = cast<SharedEncodingTrait>(srcEnc).getAlignment();
+    for (unsigned d = 0; d < dstShape.size(); ++d) {
+      if (dstShape[d] % numPieces != 0)
+        continue;
+      SmallVector<int64_t> pieceShape(dstShape.begin(), dstShape.end());
+      pieceShape[d] /= numPieces;
+      auto fitsPiece = [&](const std::vector<int32_t> &basis) {
+        for (auto [coord, size] : llvm::zip(basis, pieceShape))
+          if (coord >= size)
+            return false;
+        return true;
+      };
+      if (!llvm::all_of(offsetBases, fitsPiece) ||
+          !llvm::all_of(blockBases, fitsPiece))
+        continue;
+      LinearLayout::BasesT pieceBases;
+      pieceBases[kOffset] = offsetBases;
+      pieceBases[kBlock] = blockBases;
+      SmallVector<std::pair<StringAttr, int32_t>> pieceOutDims;
+      for (auto [name, size] : llvm::zip(outDimNames, pieceShape))
+        pieceOutDims.push_back({name, static_cast<int32_t>(size)});
+      LinearLayout pieceLL(std::move(pieceBases), pieceOutDims,
+                           /*requireSurjective=*/false);
+      if (!pieceLL.isSurjective())
+        continue;
+      auto inner =
+          SharedLinearEncodingAttr::get(ctx, std::move(pieceLL), alignment);
+      auto candidate = PartitionedSharedEncodingAttr::get(
+          ctx, partitioned.getNumPartitions(), partitioned.getNumGroups(), d,
+          inner);
+      if (toLinearLayout(dstShape, candidate) == dstLL) {
+        dstEnc = candidate;
+        return success();
+      }
+    }
+    return failure();
   }
 
   // Generic LL case
@@ -671,7 +726,8 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
   if (Attribute srcEnc = srcTy.getEncoding()) {
     if (failed(inferMemDescReshapeOpEncoding(srcTy.getShape(), srcEnc, dstShape,
                                              dstEncoding)))
-      return failure();
+      return emitOptionalError(loc, "cannot express the shared encoding of "
+                                    "the reshaped memdesc");
   }
 
   SmallVector<int64_t> dstAllocShape =
