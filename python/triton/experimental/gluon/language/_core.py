@@ -774,6 +774,18 @@ def num_warps(_semantic=None, _generator=None):
 
 
 @builtin
+def warp_id(_semantic=None):
+    """
+    Returns the ID of the warp executing this code, as a warp-uniform int32 in
+    ``[0, num_warps)``.
+
+    Branching on it is how block ping-pong and warp specialization are written
+    as plain code: the warps that take each branch are visible in the source.
+    """
+    return tensor(_semantic.builder.create_warp_id(), int32)
+
+
+@builtin
 def num_ctas(_semantic=None):
     """
     Returns the number of CTAs in the current kernel

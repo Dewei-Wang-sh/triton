@@ -1544,6 +1544,23 @@ void init_gluon_ir(py::module_ &m) {
                                            std::to_string(mask));
              self.create<ROCDL::SchedBarrier>(*schedMask);
            })
+      // Plumb WYSIWYG front end: the block ping-pong primitives, written in
+      // the kernel source instead of synthesized by the warp-pipeline passes.
+      .def("create_warp_id",
+           [](GluonOpBuilder &self) -> Value {
+             return self.create<ttg::WarpIdOp>();
+           })
+      .def("create_amd_s_barrier",
+           [](GluonOpBuilder &self) { self.create<ROCDL::SBarrierOp>(); })
+      .def("create_local_barrier",
+           [](GluonOpBuilder &self) {
+             self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
+           })
+      .def("create_amd_wave_any",
+           [](GluonOpBuilder &self, Value pred) -> Value {
+             return self.create<ttag::WaveAnyOp>(self.getBuilder().getI1Type(),
+                                                 pred);
+           })
       .def("create_warp_pipeline_border",
            [](GluonOpBuilder &self, const std::string &marker, int priority) {
              auto border =

@@ -51,6 +51,32 @@ struct CondBarrierOpConversion
   }
 };
 
+// OR the thread's own elements, then ballot across the wave. The ballot mask is
+// wave-uniform (SGPR), so a branch on the result is a scalar branch.
+struct WaveAnyOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::WaveAnyOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::WaveAnyOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    SmallVector<Value> elems =
+        unpackLLElements(loc, adaptor.getPred(), rewriter);
+    Value any = b.false_val();
+    for (Value v : elems)
+      any = b.or_(any, v);
+    unsigned waveSize = triton::gpu::lookupThreadsPerWarp(rewriter);
+    Type maskTy = rewriter.getIntegerType(waveSize);
+    Value mask = ROCDL::BallotOp::create(rewriter, loc, maskTy, any);
+    Value zero = LLVM::ConstantOp::create(rewriter, loc, maskTy,
+                                          rewriter.getIntegerAttr(maskTy, 0));
+    rewriter.replaceOp(op, b.icmp_ne(mask, zero));
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::triton::AMD::populateSPMDOpToLLVMPattern(
@@ -58,4 +84,5 @@ void mlir::triton::AMD::populateSPMDOpToLLVMPattern(
     PatternBenefit benefit) {
   patterns.add<GetNumProgramsOpConversion>(typeConverter, benefit);
   patterns.add<CondBarrierOpConversion>(typeConverter, benefit);
+  patterns.add<WaveAnyOpConversion>(typeConverter, benefit);
 }

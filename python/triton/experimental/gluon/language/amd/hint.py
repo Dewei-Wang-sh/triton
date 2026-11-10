@@ -13,14 +13,18 @@ def sched_barrier(allow=None, _semantic=None):
     Args:
         allow (str or tuple[str, ...], optional): Instruction classes allowed to
             cross the barrier. None means that no instruction classes may cross.
-            Currently only None is allowed.
+            Supported: None (mask 0, nothing crosses) and
+            "non_mem_non_sideeffect" (mask 1, ALU instructions that neither
+            access memory nor have side effects may cross; memory ops keep
+            their program order). The latter is what the warp-pipeline
+            lowering places after every memory op inside a stage.
     """
     allow = _unwrap_if_constexpr(allow)
     if allow is None or isinstance(allow, str):
         allow = (allow, )
 
     # map instruction classes to their corresponding masks
-    instruction_masks = {None: 0}
+    instruction_masks = {None: 0, "non_mem_non_sideeffect": 1}
     mask = 0
     for instruction in allow:
         instruction = _unwrap_if_constexpr(instruction)

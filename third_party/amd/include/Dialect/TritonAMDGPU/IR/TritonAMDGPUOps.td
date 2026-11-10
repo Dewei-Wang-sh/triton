@@ -257,6 +257,32 @@ def CondBarrierOp : TT_AMDGPU_Op<"cond_barrier"> {
   let assemblyFormat = "$pred attr-dict";
 }
 
+//===----------------------------------------------------------------------===//
+// WaveAnyOp
+//===----------------------------------------------------------------------===//
+
+def WaveAnyOp : TT_AMDGPU_Op<"wave_any", [NoMemoryEffect]> {
+  let summary = "True if any element held by any lane of this wave is true";
+
+  let description = [{
+      Reduces a distributed i1 tensor to one wave-uniform i1: the per-thread
+      elements are OR-ed, then a wave ballot tests whether any lane is set.
+
+      The result is uniform within a wave but may differ between waves of the
+      same CTA. Branching on it (`scf.if`) lowers to a scalar branch on the
+      ballot mask; no exec-mask manipulation is involved. Every lane of the wave
+      must be active when this op executes.
+
+      Used by Plumb's WYSIWYG Gluon front end for per-wave work skipping, e.g.
+      the lazy softmax rescale in FlashAttention.
+  }];
+
+  let arguments = (ins TT_BoolTensor:$pred);
+  let results = (outs I1:$result);
+
+  let assemblyFormat = "$pred attr-dict `:` type($pred)";
+}
+
 // The base of a buffer load or store: a scalar global pointer, from which the
 // compiler builds a default descriptor, or an explicit buffer descriptor.
 def TTAMDG_BufferBase : AnyTypeOf<[TT_Ptr, TritonAMDGPU_BufferDescType]>;

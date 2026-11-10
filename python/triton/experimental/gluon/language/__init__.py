@@ -63,6 +63,7 @@ from ._core import (
     fp4_to_fp,
     gather,
     num_warps,
+    warp_id,
     num_ctas,
     histogram,
     inline_asm_elementwise,

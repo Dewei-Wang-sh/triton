@@ -6,8 +6,9 @@ from . import gfx1250
 from . import hint
 from .slice import slice
 from .warp_pipeline import warp_pipeline_stage
+from .sync import s_barrier, local_barrier, wave_any
 
 __all__ = [
     "AMDMFMALayout", "AMDWMMALayout", "cdna3", "cdna4", "cdna5", "rdna3", "rdna4", "gfx1250", "warp_pipeline_stage",
-    "slice", "hint"
+    "slice", "hint", "s_barrier", "local_barrier", "wave_any"
 ]
