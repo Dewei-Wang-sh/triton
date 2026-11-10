@@ -1,0 +1,781 @@
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Support/LLVM.h"
+#include "mlir/Support/LogicalResult.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/Passes.h"
+
+#include "TritonLLVMTransforms/Passes.h"
+#include "llvm/ADT/StringSwitch.h"
+
+#define DEBUG_TYPE "tritonllvm-vectorize"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+using namespace mlir;
+
+namespace mlir {
+
+#define GEN_PASS_DEF_TRITONLLVMVECTORIZE
+#include "TritonLLVMTransforms/Passes.h.inc"
+
+namespace {
+// The normal pipeline sets FP32 denormal handling after LLVM translation. This
+// experiment needs it earlier so the native-to-generic exp2 rewrite can check it.
+// Preserve the non-FP32 modes and leave standalone inputs unchanged unless the
+// caller explicitly requests an environment override.
+void configureFP32DenormalMode(ModuleOp module, bool allowFlushDenorm) {
+  auto fp32Mode = allowFlushDenorm ? LLVM::DenormalModeKind::PreserveSign
+                                   : LLVM::DenormalModeKind::IEEE;
+  module.walk([&](LLVM::LLVMFuncOp function) {
+    if (function.isExternal())
+      return;
+    auto env = function.getDenormalFpenv();
+    function.setDenormalFpenvAttr(LLVM::DenormalFPEnvAttr::get(
+        function.getContext(),
+        env ? env->getDefaultOutputMode() : LLVM::DenormalModeKind::IEEE,
+        env ? env->getDefaultInputMode() : LLVM::DenormalModeKind::IEEE,
+        fp32Mode, fp32Mode));
+  });
+}
+
+// Native FP32 exp2 always flushes subnormals. Only use the generic intrinsic
+// when its function environment guarantees the same behavior.
+void rewriteExp2WithFlushMode(ModuleOp module) {
+  module.walk([](LLVM::LLVMFuncOp function) {
+    auto env = function.getDenormalFpenv();
+    if (!env ||
+        env->getFloatInputMode() != LLVM::DenormalModeKind::PreserveSign ||
+        env->getFloatOutputMode() != LLVM::DenormalModeKind::PreserveSign)
+      return;
+    function.walk([](ROCDL::ROCDLExp2 op) {
+      if (!op.getType().isF32())
+        return;
+      OpBuilder builder(op);
+      auto replacement = LLVM::Exp2Op::create(
+          builder, op.getLoc(), op.getType(), op->getOperand(0));
+      op.replaceAllUsesWith(replacement.getResult());
+      op.erase();
+    });
+  });
+}
+
+// Keep the intrinsic's aggregate result and its scalar extractions together.
+// A vector overload, if one exists, requires an intrinsic-specific rewrite.
+bool isIntrinsicResultExtraction(LLVM::ExtractValueOp op) {
+  return isa_and_nonnull<LLVM::CallIntrinsicOp>(
+      op.getContainer().getDefiningOp());
+}
+
+// A vector is an alternate SSA representation of a numeric tuple, not a
+// replacement for its storage layout or an intrinsic/function signature.
+VectorType getNumericTupleVectorType(LLVM::LLVMStructType type) {
+  if (!type || type.isIdentified() || type.isPacked() || type.isOpaque())
+    return {};
+  auto body = type.getBody();
+  if (body.empty() || !isa<IntegerType, FloatType>(body.front()) ||
+      !LLVM::isCompatibleType(body.front()) || !llvm::all_equal(body))
+    return {};
+  return VectorType::get({static_cast<int64_t>(body.size())}, body.front());
+}
+
+// Disabled: intrinsic results and their scalar extractions are preserved.
+// Re-enable only when general tuple/vector boundary adaptation is needed.
+/*
+Value materializeTupleAsVector(OpBuilder &builder, VectorType type,
+                               ValueRange inputs, Location loc) {
+  if (inputs.size() != 1 ||
+      getNumericTupleVectorType(
+          dyn_cast<LLVM::LLVMStructType>(inputs.front().getType())) != type)
+    return {};
+
+  Value vector = LLVM::UndefOp::create(builder, loc, type);
+  for (int64_t i = 0; i < type.getNumElements(); ++i) {
+    Value element =
+        LLVM::ExtractValueOp::create(builder, loc, type.getElementType(),
+                                     inputs.front(), ArrayRef<int64_t>{i});
+    Value index =
+        LLVM::ConstantOp::create(builder, loc, builder.getI32Type(), i);
+    vector = LLVM::InsertElementOp::create(builder, loc, type, vector, element,
+                                           index);
+  }
+  return vector;
+}
+
+Value materializeVectorAsTuple(OpBuilder &builder, LLVM::LLVMStructType type,
+                               ValueRange inputs, Location loc) {
+  auto vectorType = getNumericTupleVectorType(type);
+  if (!vectorType || inputs.size() != 1 ||
+      inputs.front().getType() != vectorType)
+    return {};
+
+  Value tuple = LLVM::UndefOp::create(builder, loc, type);
+  for (int64_t i = 0; i < vectorType.getNumElements(); ++i) {
+    Value index =
+        LLVM::ConstantOp::create(builder, loc, builder.getI32Type(), i);
+    Value element = LLVM::ExtractElementOp::create(
+        builder, loc, vectorType.getElementType(), inputs.front(), index);
+    tuple = LLVM::InsertValueOp::create(builder, loc, type, tuple, element,
+                                        ArrayRef<int64_t>{i});
+  }
+  return tuple;
+}
+*/
+
+class ConvertUndef : public OpConversionPattern<LLVM::UndefOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(LLVM::UndefOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type newTy = getTypeConverter()->convertType(op.getType());
+    if (newTy != op.getType()) {
+      rewriter.replaceOpWithNewOp<LLVM::UndefOp>(op, newTy);
+      return success();
+    }
+    return failure();
+  }
+};
+
+class ConvertInsertValue : public OpConversionPattern<LLVM::InsertValueOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(LLVM::InsertValueOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type newTy = getTypeConverter()->convertType(op.getType());
+    if (newTy != op.getType()) {
+      auto pos = op.getPosition();
+      assert(pos.size() == 1 &&
+             "Only single index insertvalue is supported in this pass");
+      Value newPos = LLVM::ConstantOp::create(rewriter, op.getLoc(),
+                                              rewriter.getI32Type(), pos[0]);
+      rewriter.replaceOpWithNewOp<LLVM::InsertElementOp>(
+          op, newTy, adaptor.getContainer(), adaptor.getValue(), newPos);
+      return success();
+    }
+    return failure();
+  }
+};
+
+class ConvertExtractValue : public OpConversionPattern<LLVM::ExtractValueOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(LLVM::ExtractValueOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (isIntrinsicResultExtraction(op))
+      return failure();
+    Type oldTy = op.getContainer().getType();
+    Type newTy = getTypeConverter()->convertType(oldTy);
+    if (newTy != oldTy) {
+      auto pos = op.getPosition();
+      assert(pos.size() == 1 &&
+             "Only single index insertvalue is supported in this pass");
+      Value newPos = LLVM::ConstantOp::create(rewriter, op.getLoc(),
+                                              rewriter.getI32Type(), pos[0]);
+      rewriter.replaceOpWithNewOp<LLVM::ExtractElementOp>(
+          op, op.getType(), adaptor.getContainer(), newPos);
+      return success();
+    }
+    return failure();
+  }
+};
+
+template <typename BranchOp>
+class ConvertBranch : public OpConversionPattern<BranchOp> {
+public:
+  using OpConversionPattern<BranchOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(BranchOp op, typename BranchOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    const TypeConverter *converter = this->getTypeConverter();
+    for (unsigned i = 0; i < op->getNumSuccessors(); ++i) {
+      // Signature conversion redirects all incoming edges. Read successors
+      // from the op again so shared destinations and backedges are converted
+      // only once, including when both cond_br edges target the same block.
+      Block *successor = op->getSuccessor(i);
+      if (converter->isLegal(successor->getArgumentTypes()))
+        continue;
+      auto signature = converter->convertBlockSignature(successor);
+      if (!signature)
+        return rewriter.notifyMatchFailure(op, "cannot convert block arguments");
+      rewriter.applySignatureConversion(successor, *signature, converter);
+    }
+
+    // Tuple-to-vector conversion is 1:1, so operand segments stay unchanged.
+    // Updating in place also preserves branch weights and loop annotations.
+    rewriter.modifyOpInPlace(op, [&] { op->setOperands(adaptor.getOperands()); });
+    return success();
+  }
+};
+
+// ------------------------------------------------------------
+// Helper functions to check Value group pattern
+// ------------------------------------------------------------
+// Check if all values in a range are equal
+bool allEqual(ArrayRef<Value> vals) {
+  if (vals.empty())
+    return true;
+  Value first = vals[0];
+  for (Value v : vals.drop_front()) {
+    if (v != first)
+      return false;
+  }
+  return true;
+}
+
+// Check if the entire sequence is K repetitions of the first P elements
+bool isRepeatingPattern(ArrayRef<Value> values, size_t period) {
+  if (values.size() % period != 0)
+    return false;
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (values[i] != values[i % period])
+      return false;
+  }
+  return true;
+}
+
+// Check if sequence is made of constant blocks of size `blockSize`
+bool isGroupConstantPattern(ArrayRef<Value> values, size_t groupSize) {
+  if (values.size() % groupSize != 0)
+    return false;
+  size_t numGroups = values.size() / groupSize;
+  for (size_t b = 0; b < numGroups; ++b) {
+    ArrayRef<Value> group = values.slice(b * groupSize, groupSize);
+    if (!allEqual(group))
+      return false;
+  }
+  return true;
+}
+
+// Infer the best sub-vector size
+std::pair<size_t, bool> inferSubVectorSize(ArrayRef<Value> values) {
+  size_t N = values.size();
+  if (N <= 1)
+    return {N, false};
+
+  assert(llvm::isPowerOf2_64(N) && "Total size must be power of two");
+  int logN = llvm::Log2_64(N);
+  for (int i = logN; i >= 1; --i) {
+    size_t subSize = size_t{1} << i;
+    // Group-constant works for any size (including full vector)
+    if (isGroupConstantPattern(values, subSize)) {
+      return {subSize, false};
+    }
+  }
+  for (int i = 1; i < logN; ++i) {
+    size_t subSize = size_t{1} << i;
+    // Repeating pattern only counts if it actually repeats (≥2 times)
+    if (isRepeatingPattern(values, subSize)) {
+      return {subSize, true};
+    }
+  }
+  return {1, false};
+}
+
+// Split values into chunks of size `subSize`
+bool groupValuesIntoChunks(ArrayRef<Value> values, size_t subSize,
+                           SmallVectorImpl<SmallVector<Value>> &groups) {
+  if (subSize == 0 || values.size() % subSize != 0) {
+    return false;
+  }
+  groups.clear();
+  size_t numGroups = values.size() / subSize;
+  groups.reserve(numGroups);
+  for (size_t i = 0; i < numGroups; ++i) {
+    auto start = values.begin() + i * subSize;
+    groups.emplace_back(start, start + subSize);
+  }
+  return true;
+}
+
+Value vectorizeFromScalar(Value scalar, int64_t numElements, Operation *srcOp) {
+  OpBuilder b(srcOp);
+  Location loc = srcOp->getLoc();
+  auto scalarTy = scalar.getType();
+  auto vecTy = VectorType::get(numElements, scalarTy);
+
+  /// vectorize scalar constant
+  if (auto cst = dyn_cast_if_present<LLVM::ConstantOp>(scalar.getDefiningOp())) {
+    if (scalarTy.isFloat()) {
+      APFloat cstVal(0.0);
+      (void)matchPattern(scalar, m_ConstantFloat(&cstVal));
+      auto fpAttr = b.getFloatAttr(scalarTy, cstVal);
+      auto dense =
+          DenseElementsAttr::get(cast<mlir::ShapedType>(vecTy), fpAttr);
+      auto cstVec = LLVM::ConstantOp::create(b, loc, vecTy, dense);
+      return cstVec;
+    } else {
+      assert(scalarTy.isInteger() &&
+             "only support float or integer scalar vectorization");
+      APInt cstVal;
+      (void)matchPattern(scalar, m_ConstantInt(&cstVal));
+      auto intAttr = b.getIntegerAttr(scalarTy, cstVal.getSExtValue());
+      auto dense =
+          DenseElementsAttr::get(cast<mlir::ShapedType>(vecTy), intAttr);
+      auto cstVec = LLVM::ConstantOp::create(b, loc, vecTy, dense);
+      return cstVec;
+    }
+  }
+  /// vectorize scalar value
+  Value undef = LLVM::UndefOp::create(b, loc, vecTy);
+  Value zero = LLVM::ConstantOp::create(b, loc, b.getI32Type(), 0);
+  // But note: insertelement expects i32/i64 index — use i32 for consistency
+  // with LLVM
+  Value inserted = LLVM::InsertElementOp::create(b, loc, undef, scalar, zero);
+  SmallVector<int32_t> mask(numElements, 0);
+  // auto maskVecTy = VectorType::get({numElements}, b.getI32Type());
+  // auto maskAttr = DenseIntElementsAttr::get(maskVecTy, maskVals);
+  // Value mask = LLVM::ConstantOp::create(b, loc, maskVecTy, maskAttr);
+  return LLVM::ShuffleVectorOp::create(b, loc, vecTy, inserted, undef, mask);
+}
+
+Value vectorizeFromSubVector(SmallVector<Value> subVectors, Operation *srcOp) {
+  assert(!subVectors.empty() && "No sub-vectors provided");
+  if (subVectors.size() == 1)
+    return subVectors[0];
+  assert(llvm::isPowerOf2_64(subVectors.size()) &&
+         "Number of sub-vectors must be power of two");
+  OpBuilder b(srcOp);
+  Location loc = srcOp->getLoc();
+
+  // Work on a mutable list
+  SmallVector<Value> current = subVectors;
+
+  // Get element type and sub-vector length
+  auto vecType = cast<VectorType>(current[0].getType());
+  unsigned subLen = vecType.getNumElements();
+  Type elementType = vecType.getElementType();
+
+  // Binary tree reduction
+  while (current.size() > 1) {
+    SmallVector<Value> next;
+    for (size_t i = 0; i < current.size(); i += 2) {
+      Value left = current[i];
+      Value right = current[i + 1];
+
+      // New vector length = 2 * subLen
+      unsigned newLen = 2 * subLen;
+      auto newVecType = VectorType::get(newLen, elementType);
+
+      SmallVector<int32_t> mask(newLen);
+      std::iota(mask.begin(), mask.end(), 0);
+      // auto maskAttr = b.getI32ArrayAttr(mask);
+      Value shuffled =
+          LLVM::ShuffleVectorOp::create(b, loc, newVecType, left, right, mask);
+      next.push_back(shuffled);
+    }
+    current = std::move(next);
+    subLen *= 2; // double the segment size
+  }
+
+  return current[0]; // final assembled vector
+}
+
+// generic vectorize
+Value vectorizeFromScalars(SmallVectorImpl<Value> &scalars, Operation *srcOp) {
+  OpBuilder b(srcOp);
+  auto loc = srcOp->getLoc();
+  auto vecType = VectorType::get(scalars.size(), scalars[0].getType());
+  Value vector = LLVM::UndefOp::create(b, loc, vecType);
+  for (size_t i = 0; i < scalars.size(); ++i) {
+    auto idx = LLVM::ConstantOp::create(
+        b, loc, b.getI32Type(), b.getI32IntegerAttr(static_cast<int32_t>(i)));
+    vector =
+        LLVM::InsertElementOp::create(b, loc, vecType, vector, scalars[i], idx);
+    // visitedInsert.insert(vector.getDefiningOp());
+  }
+  return vector;
+}
+
+// create llvm op with vectorized src (binary ops)
+Value createLLVMVecOpBinary(OpBuilder &b, Location loc, StringRef opName,
+                            Value lhs, Value rhs, Type type) {
+  // Note: avoid llvm::StringSwitch with create(...), since that eagerly
+  // builds all candidate ops. Use explicit string comparisons instead.
+
+  // Integer arithmetic
+  if (opName == "add")
+    return LLVM::AddOp::create(b, loc, type, lhs, rhs);
+  if (opName == "sub")
+    return LLVM::SubOp::create(b, loc, type, lhs, rhs);
+  if (opName == "mul")
+    return LLVM::MulOp::create(b, loc, type, lhs, rhs);
+  if (opName == "udiv")
+    return LLVM::UDivOp::create(b, loc, type, lhs, rhs);
+  if (opName == "sdiv")
+    return LLVM::SDivOp::create(b, loc, type, lhs, rhs);
+  if (opName == "urem")
+    return LLVM::URemOp::create(b, loc, type, lhs, rhs);
+  if (opName == "srem")
+    return LLVM::SRemOp::create(b, loc, type, lhs, rhs);
+
+  // Bitwise
+  if (opName == "and")
+    return LLVM::AndOp::create(b, loc, type, lhs, rhs);
+  if (opName == "or")
+    return LLVM::OrOp::create(b, loc, type, lhs, rhs);
+  if (opName == "xor")
+    return LLVM::XOrOp::create(b, loc, type, lhs, rhs);
+  if (opName == "shl")
+    return LLVM::ShlOp::create(b, loc, type, lhs, rhs);
+  if (opName == "lshr")
+    return LLVM::LShrOp::create(b, loc, type, lhs, rhs);
+  if (opName == "ashr")
+    return LLVM::AShrOp::create(b, loc, type, lhs, rhs);
+
+  // Floating-point arithmetic
+  if (opName == "fadd")
+    return LLVM::FAddOp::create(b, loc, type, lhs, rhs);
+  if (opName == "fsub")
+    return LLVM::FSubOp::create(b, loc, type, lhs, rhs);
+  if (opName == "fmul")
+    return LLVM::FMulOp::create(b, loc, type, lhs, rhs);
+  if (opName == "fdiv")
+    return LLVM::FDivOp::create(b, loc, type, lhs, rhs);
+  if (opName == "frem")
+    return LLVM::FRemOp::create(b, loc, type, lhs, rhs);
+
+  return Value{};
+}
+
+// create llvm op with vectorized src (unary ops)
+Value createLLVMVecOpUnary(OpBuilder &b, Location loc, StringRef opName,
+                           Value operand, Type type) {
+  // Same reasoning as above: use explicit comparisons to only build
+  // the op we actually need.
+
+  if (opName == "fneg")
+    return LLVM::FNegOp::create(b, loc, type, operand);
+  if (opName == "intr.exp2")
+    return LLVM::Exp2Op::create(b, loc, type, operand);
+  if (opName == "trunc")
+    return LLVM::TruncOp::create(b, loc, type, operand);
+  if (opName == "zext")
+    return LLVM::ZExtOp::create(b, loc, type, operand);
+  if (opName == "sext")
+    return LLVM::SExtOp::create(b, loc, type, operand);
+  if (opName == "fpext")
+    return LLVM::FPExtOp::create(b, loc, type, operand);
+  if (opName == "fptrunc")
+    return LLVM::FPTruncOp::create(b, loc, type, operand);
+  if (opName == "sitofp")
+    return LLVM::SIToFPOp::create(b, loc, type, operand);
+  if (opName == "uitofp")
+    return LLVM::UIToFPOp::create(b, loc, type, operand);
+  if (opName == "fptosi")
+    return LLVM::FPToSIOp::create(b, loc, type, operand);
+  if (opName == "fptoui")
+    return LLVM::FPToUIOp::create(b, loc, type, operand);
+  if (opName == "bitcast")
+    return LLVM::BitcastOp::create(b, loc, type, operand);
+  if (opName == "ptrtoint")
+    return LLVM::PtrToIntOp::create(b, loc, type, operand);
+  if (opName == "inttoptr")
+    return LLVM::IntToPtrOp::create(b, loc, type, operand);
+
+  return Value{};
+}
+
+std::tuple<bool, SmallVector<APInt>, SmallVector<int32_t>>
+checkPositionSequentialFromZero(SmallVectorImpl<Value> &positions) {
+  SmallVector<int32_t> cst;
+  SmallVector<APInt> pos;
+  for (auto p : positions) {
+    APInt cstVal;
+    if (!matchPattern(p, m_ConstantInt(&cstVal))) {
+      return {false, {}, {}};
+    }
+    pos.push_back(cstVal);
+    cst.push_back(cstVal.getSExtValue());
+  }
+  return {llvm::equal(cst, llvm::seq<int32_t>(cst.size())), pos, cst};
+}
+
+FailureOr<Value> tryVectorizeValues(SmallVector<Value> &values,
+                                    Operation *srcOp, bool enforce = true) {
+  // Keep intrinsic aggregates and native exp2 outside reconstruction.
+  if (llvm::any_of(values, [](Value value) {
+        return isa_and_nonnull<LLVM::CallIntrinsicOp, LLVM::ExtractValueOp,
+                              ROCDL::ROCDLExp2>(value.getDefiningOp());
+      }))
+    return failure();
+
+  auto fallback = [&]() -> FailureOr<Value> {
+    if (enforce)
+      return vectorizeFromScalars(values, srcOp);
+    return failure();
+  };
+  auto [subSize, isRepeating] = inferSubVectorSize(values);
+  if (subSize == values.size())
+    return vectorizeFromScalar(values[0], values.size(), srcOp);
+  if (subSize > 1) {
+    SmallVector<SmallVector<Value>> groups;
+    groupValuesIntoChunks(values, subSize, groups);
+    SmallVector<Value> subVectors;
+    for (auto &group : groups) {
+      if (isRepeating && !subVectors.empty()) {
+        subVectors.push_back(subVectors.front());
+        continue;
+      }
+      auto vector = tryVectorizeValues(group, srcOp, enforce);
+      if (failed(vector))
+        return fallback();
+      subVectors.push_back(*vector);
+    }
+    return vectorizeFromSubVector(subVectors, srcOp);
+  }
+
+  // Block arguments and unmatched producers are scalar leaves. Never inspect
+  // a partial operand list or assume that every value has a defining op.
+  Operation *first = values.front().getDefiningOp();
+  if (!first)
+    return fallback();
+  SmallVector<Value> src0, src1, src2;
+  for (Value value : values) {
+    Operation *op = value.getDefiningOp();
+    if (!op || op->getName() != first->getName())
+      return fallback();
+    if (isa<LLVM::ConstantOp>(op)) {
+      src0.push_back(value);
+    } else if (auto extract = dyn_cast<LLVM::ExtractElementOp>(op)) {
+      src0.push_back(extract.getVector());
+      src1.push_back(extract.getPosition());
+    } else {
+      // Require the same predicate/flags on every lane. Copy these attributes
+      // onto the vector operation without strengthening any lane's contract.
+      if (op->getAttrDictionary() != first->getAttrDictionary() ||
+          op->getOperandTypes() != first->getOperandTypes())
+        return fallback();
+      if (auto select = dyn_cast<LLVM::SelectOp>(op)) {
+        src0.push_back(select.getCondition());
+        src1.push_back(select.getTrueValue());
+        src2.push_back(select.getFalseValue());
+      } else if (auto compare = dyn_cast<LLVM::ICmpOp>(op)) {
+        // Numeric vector reconstruction does not support vectors of pointers.
+        if (!isa<IntegerType>(compare.getLhs().getType()))
+          return fallback();
+        src0.push_back(compare.getLhs());
+        src1.push_back(compare.getRhs());
+      } else if (isa<LLVM::TruncOp, LLVM::ZExtOp, LLVM::SExtOp, LLVM::FNegOp,
+                     LLVM::FPExtOp, LLVM::FPTruncOp, LLVM::SIToFPOp,
+                     LLVM::UIToFPOp, LLVM::FPToSIOp, LLVM::FPToUIOp,
+                     LLVM::BitcastOp, LLVM::Exp2Op>(op)) {
+        src0.push_back(op->getOperand(0));
+      } else if (isa<LLVM::AddOp, LLVM::SubOp, LLVM::MulOp, LLVM::UDivOp,
+                     LLVM::SDivOp, LLVM::URemOp, LLVM::SRemOp, LLVM::AndOp,
+                     LLVM::OrOp, LLVM::XOrOp, LLVM::ShlOp, LLVM::LShrOp,
+                     LLVM::AShrOp, LLVM::FAddOp, LLVM::FSubOp, LLVM::FMulOp,
+                     LLVM::FDivOp, LLVM::FRemOp>(op)) {
+        src0.push_back(op->getOperand(0));
+        src1.push_back(op->getOperand(1));
+      } else {
+        return fallback();
+      }
+    }
+  }
+
+  OpBuilder builder(srcOp);
+  Location loc = srcOp->getLoc();
+  auto dstType = VectorType::get(values.size(), values.front().getType());
+  if (isa<LLVM::ConstantOp>(first)) {
+    SmallVector<Attribute> elements;
+    for (Value value : values)
+      elements.push_back(
+          cast<LLVM::ConstantOp>(value.getDefiningOp()).getValue());
+    return LLVM::ConstantOp::create(builder, loc, dstType,
+                                    DenseElementsAttr::get(dstType, elements))
+        .getResult();
+  }
+  if (isa<LLVM::ExtractElementOp>(first)) {
+    auto [groupSize, repeating] = inferSubVectorSize(src0);
+    if (groupSize == 1 || repeating)
+      return fallback();
+    SmallVector<SmallVector<Value>> vectors, positions;
+    groupValuesIntoChunks(src0, groupSize, vectors);
+    groupValuesIntoChunks(src1, groupSize, positions);
+    SmallVector<Value> subVectors;
+    for (unsigned i = 0; i < vectors.size(); ++i) {
+      auto [sequential, unused, indices] =
+          checkPositionSequentialFromZero(positions[i]);
+      auto type = cast<VectorType>(vectors[i][0].getType());
+      if (indices.size() != groupSize ||
+          llvm::any_of(indices, [&](int32_t index) {
+            return index < 0 || index >= type.getNumElements();
+          }))
+        return fallback();
+      auto subType = VectorType::get(groupSize, type.getElementType());
+      if (sequential && type == subType) {
+        subVectors.push_back(vectors[i][0]);
+      } else {
+        subVectors.push_back(LLVM::ShuffleVectorOp::create(
+            builder, loc, subType, vectors[i][0], vectors[i][0], indices));
+      }
+    }
+    return vectorizeFromSubVector(subVectors, srcOp);
+  }
+
+  // Use the final pack as the insertion point throughout recursion. A later
+  // lane's operand may be defined after the first lane's scalar operation.
+  auto lhs = tryVectorizeValues(src0, srcOp);
+  if (failed(lhs))
+    return fallback();
+  Value result;
+  StringRef name = first->getName().stripDialect();
+  if (src1.empty()) {
+    result = createLLVMVecOpUnary(builder, loc, name, *lhs, dstType);
+  } else {
+    auto rhs = tryVectorizeValues(src1, srcOp);
+    if (failed(rhs))
+      return fallback();
+    if (isa<LLVM::SelectOp>(first)) {
+      auto falseValues = tryVectorizeValues(src2, srcOp);
+      if (failed(falseValues))
+        return fallback();
+      result = LLVM::SelectOp::create(builder, loc, dstType, *lhs, *rhs,
+                                      *falseValues);
+    } else if (auto compare = dyn_cast<LLVM::ICmpOp>(first)) {
+      // The operands keep their integer element type; the result is vector<i1>.
+      result = LLVM::ICmpOp::create(builder, loc, compare.getPredicate(), *lhs,
+                                    *rhs);
+    } else {
+      result = createLLVMVecOpBinary(builder, loc, name, *lhs, *rhs, dstType);
+    }
+  }
+  if (!result)
+    return fallback();
+  result.getDefiningOp()->setAttrs(first->getAttrs());
+  return result;
+}
+
+std::tuple<Value, SmallVector<Value>, SmallVector<Value>,
+           SmallVector<Operation *>>
+getChainOps(LLVM::InsertElementOp insert) {
+  SmallVector<Value> srcs;
+  SmallVector<Value> positions;
+  SmallVector<Operation *> ops;
+  LLVM::InsertElementOp next = insert;
+  Value res;
+  do {
+    srcs.push_back(next.getValue());
+    positions.push_back(next.getPosition());
+    ops.push_back(next.getOperation());
+    res = next.getRes();
+  } while (res.hasOneUse() &&
+           (next = dyn_cast<LLVM::InsertElementOp>(*res.user_begin())) && next);
+  return {res, srcs, positions, ops};
+}
+
+LogicalResult
+tryVectorizeInsertChain(LLVM::InsertElementOp insert,
+                        llvm::SetVector<Operation *> &visitedInsert) {
+  LDBG("check insert chain from : " << insert << "\n");
+  auto [dst, srcs, positions, ops] = getChainOps(insert);
+  visitedInsert.insert(ops.begin(), ops.end());
+  if (srcs.size() != insert.getVector().getType().getNumElements() ||
+      srcs.size() == 1 || !llvm::isPowerOf2_64(srcs.size()))
+    return failure();
+  bool res = std::get<0>(checkPositionSequentialFromZero(positions));
+  if (!res)
+    return failure();
+
+  LDBG("try to vectorize the insert chain" << "\n");
+  FailureOr<Value> vecSrc = tryVectorizeValues(srcs, ops.back(), false);
+  if (failed(vecSrc)) {
+    LDBG("====================" << "\n");
+    LDBG("potential but failed" << "\n");
+    LDBG("====================" << "\n");
+    return failure();
+  }
+  dst.replaceAllUsesWith(*vecSrc);
+  return success();
+}
+
+} // anonymous namespace
+
+class TritonLLVMVectorize
+    : public impl::TritonLLVMVectorizeBase<TritonLLVMVectorize> {
+private:
+  llvm::SetVector<Operation *> visitedInsert;
+
+public:
+  using TritonLLVMVectorizeBase::TritonLLVMVectorizeBase;
+  void runOnOperation() override {
+    MLIRContext *context = &getContext();
+    ModuleOp m = getOperation();
+
+    // Ensure no stale state if this pass instance is reused.
+    visitedInsert.clear();
+
+    if (setFP32DenormalMode)
+      configureFP32DenormalMode(m, allowFlushDenorm);
+    rewriteExp2WithFlushMode(m);
+
+    // step 1: convert struct type to vector type
+    mlir::TypeConverter converter;
+    converter.addConversion([](Type type) { return type; });
+    converter.addConversion([](LLVM::LLVMStructType type) -> Type {
+      if (auto vectorType = getNumericTupleVectorType(type))
+        return vectorType;
+      return type;
+    });
+    // General tuple/vector boundary adapters are disabled. Intrinsic calls
+    // and their direct aggregate extractions remain legal below.
+    // converter.addTargetMaterialization(materializeTupleAsVector);
+    // converter.addSourceMaterialization(materializeVectorAsTuple);
+
+    mlir::ConversionTarget target(*context);
+    target.addLegalDialect<LLVM::LLVMDialect>();
+    target.addLegalOp<LLVM::CallIntrinsicOp>();
+    target.addDynamicallyLegalOp<LLVM::UndefOp, LLVM::InsertValueOp>(
+        [&](Operation *op) {
+          return converter.isLegal(op->getResult(0).getType());
+        });
+    target.addDynamicallyLegalOp<LLVM::ExtractValueOp>(
+        [&](LLVM::ExtractValueOp op) {
+          // Do not request a vector adapter merely to read an intrinsic result.
+          return isIntrinsicResultExtraction(op) ||
+                 converter.isLegal(op.getContainer().getType());
+        });
+    target.addDynamicallyLegalOp<LLVM::BrOp, LLVM::CondBrOp>(
+        [&](Operation *op) { return converter.isLegal(op); });
+
+    RewritePatternSet patterns(context);
+    patterns.add<ConvertUndef, ConvertInsertValue, ConvertExtractValue,
+                 ConvertBranch<LLVM::BrOp>, ConvertBranch<LLVM::CondBrOp>>(
+        converter, context);
+
+    if (failed(applyPartialConversion(m, target, std::move(patterns))))
+      return signalPassFailure();
+
+    // llvm::dbgs() << "Module after struct to vector convert: " << m << "\n";
+
+    // step 2: iteratively vectorize ops from insertelement chains
+    SmallVector<LLVM::InsertElementOp> insertOps;
+    auto funcOps = m.getOps<LLVM::LLVMFuncOp>();
+    for (auto funcOp : funcOps) {
+      funcOp.walk<WalkOrder::PreOrder>(
+          [&](LLVM::InsertElementOp op) { insertOps.push_back(op); });
+    }
+    for (auto insert : insertOps) {
+      if (!visitedInsert.contains(insert))
+        (void)tryVectorizeInsertChain(insert, visitedInsert);
+    }
+    // step 3: canonicalize after vectorization
+    OpPassManager pm;
+    pm.addPass(mlir::createCanonicalizerPass());
+    // A reduction and a conversion can reconstruct the same wide expression.
+    pm.addPass(mlir::createCSEPass());
+    if (failed(runPipeline(pm, m)))
+      return signalPassFailure();
+    // step 4: print constant human readable
+  }
+};
+} // namespace mlir

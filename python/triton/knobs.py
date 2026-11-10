@@ -354,6 +354,9 @@ class cache_knobs(base_knobs):
 
 
 class compilation_knobs(base_knobs):
+    # Opt in to Plumb's LLVM lowering changes and the AMD LLVM vectorization pass.
+    # Disabled by default to retain the upstream compilation paths.
+    llvm_vectorize: env_bool = env_bool("TRITON_LLVM_VECTORIZE", False)
     override: env_bool = env_bool("TRITON_KERNEL_OVERRIDE")
     dump_ir: env_bool = env_bool("TRITON_KERNEL_DUMP")
     dump_ir_extract_di_local_variables: env_bool = env_bool("LLVM_EXTRACT_DI_LOCAL_VARIABLES")

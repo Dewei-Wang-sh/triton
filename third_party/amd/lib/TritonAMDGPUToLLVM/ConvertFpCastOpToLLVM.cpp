@@ -24,6 +24,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include <type_traits>
 
 using namespace mlir;
@@ -37,6 +38,27 @@ namespace {
 bool isCDNA4OrHigher(ISAFamily family) {
   return family == ISAFamily::CDNA4 || family == ISAFamily::CDNA5;
 }
+// Preserve a full per-thread BF16 conversion as a vectorization sink. The
+// upstream path keeps its scalar/packed conversions when the knob is disabled.
+SmallVector<Value> convertFp32ToBf16Vectorized(
+    Location loc, ConversionPatternRewriter &rewriter,
+    MultipleOperandsRange operands) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  if (operands.size() == 1)
+    return {b.fptrunc(bf16_ty, operands[0][0])};
+
+  auto inVecTy = vec_ty(f32_ty, operands.size());
+  auto retVecTy = vec_ty(bf16_ty, operands.size());
+  Value inVec = b.undef(inVecTy);
+  for (size_t i = 0; i < operands.size(); ++i)
+    inVec = b.insert_element(inVecTy, inVec, operands[i][0], b.i32_val(i));
+  Value retVec = b.fptrunc(retVecTy, inVec);
+  SmallVector<Value> ret(operands.size());
+  for (size_t i = 0; i < operands.size(); ++i)
+    ret[i] = b.extract_element(bf16_ty, retVec, b.i32_val(i));
+  return ret;
+}
+
 // List of architectures that have hardware support for OCP fp8 formats via the
 // *unscaled* cvt instructions, i.e. v_cvt_{f32_fp8,f32_bf8} and
 // v_cvt_pk_{fp8_f32,bf8_f32}. These are the same instructions CDNA3 uses for
@@ -105,6 +127,10 @@ SmallVector<Value> convertFp32ToF16rtne(Location loc,
                                         Type inElemTy, Type outElemTy,
                                         MultipleOperandsRange operands,
                                         ISAFamily isaFamily) {
+  if (isCDNA4OrHigher(isaFamily) && outElemTy.isBF16() &&
+      triton::tools::getBoolEnv("TRITON_LLVM_VECTORIZE"))
+    return convertFp32ToBf16Vectorized(loc, rewriter, operands);
+
   // For CDNA4 we can potentially use packed v_cvt_pk_[b]f16_f32 instructions.
   if (isCDNA4OrHigher(isaFamily)) {
     SmallVector<Value> inVals;

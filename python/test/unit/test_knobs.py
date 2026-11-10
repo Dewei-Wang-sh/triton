@@ -184,6 +184,70 @@ def _compile_empty_hip_kernel(arch, warp_size):
     return triton.compile(triton.compiler.ASTSource(empty_kernel, {}), target=GPUTarget("hip", arch, warp_size))
 
 
+@pytest.mark.parametrize("allow_flush_denorm", [False, True])
+def test_amd_llvm_vectorize_pipeline(allow_flush_denorm, fresh_knobs, fresh_triton_cache, monkeypatch):
+    import triton.language as tl
+    from triton._C.libtriton import get_cache_invalidating_env_vars
+    from triton.backends.amd import compiler
+    from triton.backends.compiler import GPUTarget
+
+    @triton.jit
+    def kernel(x, y, total):
+        offsets = tl.arange(0, 4096)
+        values = tl.exp2(tl.load(x + offsets))
+        tl.store(y + offsets, values.to(tl.bfloat16))
+        tl.store(total, tl.sum(values, 0))
+
+    source = triton.compiler.ASTSource(kernel, {"x": "*fp32", "y": "*bf16", "total": "*fp32"})
+    original_to_module = compiler.llvm.to_module
+    modules = []
+
+    def capture_module(module, context):
+        modules.append(str(module))
+        return original_to_module(module, context)
+
+    monkeypatch.setattr(compiler.llvm, "to_module", capture_module)
+    compiled = {}
+    for setting in (None, "0", "1"):
+        if setting is None:
+            monkeypatch.delenv("TRITON_LLVM_VECTORIZE", raising=False)
+        else:
+            monkeypatch.setenv("TRITON_LLVM_VECTORIZE", setting)
+        enabled = setting == "1"
+        assert triton.knobs.compilation.llvm_vectorize == enabled
+        env_vars = get_cache_invalidating_env_vars()
+        if setting is None:
+            assert "TRITON_LLVM_VECTORIZE" not in env_vars
+        else:
+            assert env_vars["TRITON_LLVM_VECTORIZE"] == ("true" if enabled else "false")
+
+        modules.clear()
+        compiled[setting] = triton.compile(source, target=GPUTarget("hip", "gfx950", 64),
+                                           options={"allow_flush_denorm": allow_flush_denorm})
+        assert len(modules) == 1
+        module = modules[0]
+        assert ("llvm.intr.vector.reduce.fadd" in module) == enabled
+        assert ("to vector<16xbf16>" in module) == enabled
+        # With IEEE mode, native exp2 must retain its original flushing behavior.
+        assert ("rocdl.exp2" in module) == (not enabled or not allow_flush_denorm)
+        assert ("llvm.intr.exp2" in module) == (enabled and allow_flush_denorm)
+        assert ("denormal_fpenv" in module) == enabled
+        llir = compiled[setting].asm["llir"]
+        if enabled:
+            mode = "float: preservesign" if allow_flush_denorm else "ieee"
+            assert f"denormal_fpenv({mode})" in llir
+            assert "denormal-fp-math-f32" not in llir
+        else:
+            mode = "preserve-sign" if allow_flush_denorm else "ieee"
+            assert f'"denormal-fp-math-f32"="{mode}"' in llir
+
+    # Explicitly disabling the knob retains the unset/default output exactly.
+    for stage in ("llir", "amdgcn", "hsaco"):
+        assert compiled[None].asm[stage] == compiled["0"].asm[stage]
+    assert compiled["0"].hash != compiled["1"].hash
+    assert compiled["0"].asm["llir"] != compiled["1"].asm["llir"]
+
+
 def _amd_scheduler_kernel():
     arithmetic = []
     stores = []

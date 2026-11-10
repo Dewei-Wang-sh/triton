@@ -1,6 +1,7 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "TritonLLVMTransforms/Passes.h"
 #include "amd/include/hipblas_instance.h"
 #include "amd/include/hipblas_types.h"
 #include "amd/lib/Target/MFMASchedule/MFMASchedule.h"
@@ -367,6 +368,13 @@ void init_triton_amd(py::module_ &m) {
   auto passes = m.def_submodule("passes");
   auto ttgpuir_m = passes.def_submodule("ttgpuir");
   init_triton_amd_passes_ttgpuir(ttgpuir_m);
+  auto llvmir_m = passes.def_submodule("llvmir");
+  llvmir_m.def("add_vectorize", [](mlir::PassManager &pm, bool allowFlushDenorm) {
+    mlir::TritonLLVMVectorizeOptions options;
+    options.setFP32DenormalMode = true;
+    options.allowFlushDenorm = allowFlushDenorm;
+    pm.addPass(mlir::createTritonLLVMVectorize(options));
+  });
 
   m.attr("CALLING_CONV_AMDGPU_KERNEL") =
       (unsigned)llvm::CallingConv::AMDGPU_KERNEL;

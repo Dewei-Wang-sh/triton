@@ -1137,6 +1137,30 @@ def test_math_op(dtype_x, expr, x, device):
     _test_unary(dtype_x, f'tl.{expr}({x})', np_expr, device=device)
 
 
+@pytest.mark.skipif(not is_hip() or is_interpreter(), reason="Requires the AMD compiler")
+@pytest.mark.parametrize("allow_flush_denorm", [False, True])
+def test_exp_fp32_denormal_mode(allow_flush_denorm, device, monkeypatch):
+    monkeypatch.setenv("TRITON_LLVM_VECTORIZE", "1")
+
+    @triton.jit
+    def exp_kernel(x, y):
+        offsets = tl.arange(0, 4)
+        tl.store(y + offsets, tl.exp(tl.load(x + offsets)))
+
+    # exp(-100) is subnormal; exp(-80) is small but still normal in FP32.
+    x_cpu = torch.tensor([-100.0, -80.0, 0.0, 1.0], dtype=torch.float32)
+    x = x_cpu.to(device)
+    y = torch.empty_like(x)
+    exp_kernel[(1, )](x, y, num_warps=1, allow_flush_denorm=allow_flush_denorm)
+
+    expected = torch.exp(x_cpu)
+    if allow_flush_denorm:
+        expected[0] = 0.0
+    actual = y.cpu()
+    assert (actual[0].item() == 0.0) == allow_flush_denorm
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2.0**-149)
+
+
 # Interpreter only patches tensor members marked as builtins.
 # Use float32 because `sqrt_rn` only accepts fp32 tensors.
 @pytest.mark.interpreter
@@ -2764,9 +2788,14 @@ def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
 
 
 @pytest.mark.interpreter
-@pytest.mark.parametrize("dtype_x, rounding", [("float32", None), ("float32", "rtne"), ("float32", "rtz"),
-                                               ("float16", None), ("float64", None), ("int64", None), ("uint64", None)])
-def test_cast_bf16_rounding(dtype_x, rounding, device):
+@pytest.mark.parametrize("llvm_vectorize", [False, True])
+@pytest.mark.parametrize("dtype_x, rounding, size",
+                         [("float32", rounding, size)
+                          for rounding in (None, "rtne", "rtz")
+                          for size in (1024, 4096, 32768)] + [(dtype, None, 1024)
+                                                              for dtype in ("float16", "float64", "int64", "uint64")])
+def test_cast_bf16_rounding(dtype_x, rounding, size, device, llvm_vectorize, monkeypatch):
+    monkeypatch.setenv("TRITON_LLVM_VECTORIZE", "1" if llvm_vectorize else "0")
     if not is_interpreter():
         if dtype_x in ["int64", "uint64"] and (is_hip() or (is_cuda() and torch.cuda.get_device_capability()[0] < 9)):
             pytest.skip("64-bit integer to bf16 conversions round through fp32 on this target")
@@ -2792,7 +2821,9 @@ def test_cast_bf16_rounding(dtype_x, rounding, device):
         x = torch.tensor(values, dtype=dtype, device=device)
         expected = torch.tensor(expected, dtype=torch.bfloat16, device=device)
     else:
-        x = torch.randn(1024, dtype=dtype, device=device)
+        # Exercise short and full-width per-thread conversions, including the
+        # widths used by attention probabilities and accumulator stores.
+        x = torch.randn(size, dtype=dtype, device=device)
         # Ties, a carry out of the mantissa and an overflow tell round-to-nearest-even
         # apart from truncation and from rounding ties away from zero.
         x[:8] = torch.tensor([
@@ -3259,6 +3290,64 @@ def test_convert_float16_to_float32(in_dtype, device):
 # ---------------
 # test reduce
 # ---------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("op", ["add", "mul", "minnum", "maxnum", "minimum", "maximum"])
+@pytest.mark.parametrize("llvm_vectorize", [False, True])
+def test_reduce_local_fp_special_values(device, dtype, op, llvm_vectorize, monkeypatch):
+    monkeypatch.setenv("TRITON_LLVM_VECTORIZE", "1" if llvm_vectorize else "0")
+    check_type_supported(str(dtype).removeprefix("torch."), device)
+
+    @triton.jit
+    def combine(a, b):
+        GENERATE_TEST_HERE
+
+    expr = {
+        "add": "a + b",
+        "mul": "a * b",
+        "minnum": "tl.minimum(a, b)",
+        "maxnum": "tl.maximum(a, b)",
+        "minimum": "tl.minimum(a, b, propagate_nan=tl.PropagateNan.ALL)",
+        "maximum": "tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)",
+    }[op]
+    combine = patch_kernel(combine, {"GENERATE_TEST_HERE": "return " + expr})
+
+    @triton.jit
+    def kernel(X, Y, N: tl.constexpr):
+        row = tl.program_id(0)
+        x = tl.load(X + row * N + tl.arange(0, N))
+        tl.store(Y + row, tl.reduce(x, 0, combine))
+
+    # Several values per thread, then warp and cross-warp reduction. No masks
+    # introduce identities that could hide the sign of an all-negative-zero sum.
+    n = 1024
+    x = torch.ones((6, n), device=device, dtype=dtype)
+    x[0, :] = -0.0
+    x[1, :] = 0.0
+    x[1, :n // 2] = -0.0
+    x[2, n // 2] = float("nan")
+    x[3, :] = float("nan")
+    x[4, 0], x[4, -1] = float("inf"), -float("inf")
+    x[5, 0] = -1.0
+    y = torch.empty((6, ), device=device, dtype=dtype)
+    kernel[(6, )](x, y, n, num_warps=4)
+
+    nan, inf = float("nan"), float("inf")
+    expected = {
+        "add": [-0.0, 0.0, nan, nan, nan, 1022.0],
+        "mul": [0.0, 0.0, nan, nan, -inf, -1.0],
+        "minnum": [-0.0, -0.0, 1.0, nan, -inf, -1.0],
+        "maxnum": [-0.0, 0.0, 1.0, nan, inf, 1.0],
+        "minimum": [-0.0, -0.0, nan, nan, -inf, -1.0],
+        "maximum": [-0.0, 0.0, nan, nan, inf, 1.0],
+    }[op]
+    reference = torch.tensor(expected, device=device, dtype=dtype)
+    torch.testing.assert_close(y, reference, rtol=0, atol=0, equal_nan=True)
+    # LLVM minnum/maxnum permit either sign when comparing -0.0 and +0.0.
+    if op not in ("minnum", "maxnum"):
+        zeros = reference == 0
+        torch.testing.assert_close(y[zeros].signbit(), reference[zeros].signbit())
 
 
 @pytest.mark.interpreter

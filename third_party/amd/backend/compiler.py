@@ -720,6 +720,14 @@ class HIPBackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
 
+        if knobs.compilation.llvm_vectorize:
+            # Set the typed FP32 environment before vectorization. Native AMD
+            # exp2 always flushes subnormals; replacing it with generic LLVM
+            # exp2 is valid only when allow_flush_denorm=True. With False, keep
+            # native exp2 unchanged; generic exp2 retains IEEE subnormal support
+            # (including scaling around v_exp_f32). Do not force this option on.
+            amd.passes.llvmir.add_vectorize(pm, options.allow_flush_denorm)
+
         if not knobs.compilation.disable_line_info and not knobs.compilation.dump_ir_extract_di_local_variables:
             passes.llvmir.add_di_scope(pm)
 
@@ -795,8 +803,11 @@ class HIPBackend(BaseBackend):
         if is_coexec_scheduler_enabled(options.arch) and options.num_warps <= 4:
             kernel_fn.add_fn_attr("amdgpu-sched-strategy", "coexec")
 
-        denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
-        kernel_fn.add_fn_attr("denormal-fp-math-f32", denormal_mode)
+        if not knobs.compilation.llvm_vectorize:
+            # Keep upstream's attribute path when the experiment is disabled.
+            # The vectorization pass installs the typed environment earlier.
+            denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
+            kernel_fn.add_fn_attr("denormal-fp-math-f32", denormal_mode)
 
         if knobs.compilation.enable_asan:
             kernel_fn.add_fn_target_feature("+xnack")

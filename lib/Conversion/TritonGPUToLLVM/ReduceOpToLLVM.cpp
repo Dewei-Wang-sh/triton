@@ -2,8 +2,10 @@
 
 #include <memory>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
+#include "mlir/Conversion/ArithCommon/AttrToLLVMConverter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Support/LLVM.h"
@@ -15,8 +17,10 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
@@ -259,12 +263,208 @@ private:
     }
   }
 
+  template <typename ReductionOp>
+  static Value
+  createVectorReduction(Location loc, ConversionPatternRewriter &rewriter,
+                        Operation *combiner, ArrayRef<Value> values) {
+    Type elementType = values.front().getType();
+    Value vector = packLLVector(loc, values, rewriter);
+    if constexpr (std::is_same_v<ReductionOp, LLVM::vector_reduce_fadd> ||
+                  std::is_same_v<ReductionOp, LLVM::vector_reduce_fmul> ||
+                  std::is_same_v<ReductionOp, LLVM::vector_reduce_fmin> ||
+                  std::is_same_v<ReductionOp, LLVM::vector_reduce_fmax> ||
+                  std::is_same_v<ReductionOp, LLVM::vector_reduce_fminimum> ||
+                  std::is_same_v<ReductionOp, LLVM::vector_reduce_fmaximum>) {
+      auto flags = arith::convertArithFastMathFlagsToLLVM(
+          cast<arith::ArithFastMathInterface>(combiner)
+              .getFastMathFlagsAttr()
+              .getValue());
+      if constexpr (std::is_same_v<ReductionOp, LLVM::vector_reduce_fadd> ||
+                    std::is_same_v<ReductionOp, LLVM::vector_reduce_fmul>) {
+        // Triton reductions already permit reassociation. Use -0.0 for addition
+        // so an all-negative-zero group retains its sign without assuming nsz.
+        flags = flags | LLVM::FastmathFlags::reassoc;
+        double identity =
+            std::is_same_v<ReductionOp, LLVM::vector_reduce_fadd> ? -0.0 : 1.0;
+        Value start = LLVM::ConstantOp::create(
+            rewriter, loc, elementType,
+            rewriter.getFloatAttr(elementType, identity));
+        return ReductionOp::create(rewriter, loc, elementType, start, vector,
+                                   flags);
+      } else {
+        return ReductionOp::create(rewriter, loc, elementType, vector, flags);
+      }
+    } else {
+      return ReductionOp::create(rewriter, loc, elementType, vector);
+    }
+  }
+
+  // Only bypass a region that consists of a builtin combiner and its return.
+  // getSingleCombiner also accepts regions with extra operations (e.g. prints),
+  // which must still execute through the ordinary combine-region path.
+  Value tryVectorReduction(triton::ReduceOp op, ArrayRef<Value> values,
+                           ConversionPatternRewriter &rewriter) const {
+    Operation *combiner = op.getSingleCombiner();
+    if (!combiner ||
+        !llvm::hasSingleElement(op.getCombineOp().front().without_terminator()))
+      return {};
+
+    auto loc = op.getLoc();
+    return llvm::TypeSwitch<Operation *, Value>(combiner)
+        .Case<arith::AddIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_add>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MulIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_mul>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::AndIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_and>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::OrIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_or>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::XOrIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_xor>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MinSIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_smin>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MaxSIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_smax>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MinUIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_umin>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MaxUIOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_umax>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::AddFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fadd>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MulFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fmul>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MinNumFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fmin>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MaxNumFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fmax>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MinimumFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fminimum>(
+              loc, rewriter, combiner, values);
+        })
+        .Case<arith::MaximumFOp>([&](auto) {
+          return createVectorReduction<LLVM::vector_reduce_fmaximum>(
+              loc, rewriter, combiner, values);
+        })
+        .Default([](Operation *) { return Value{}; });
+  }
+
+  // Experimental full-width reduction; keep the upstream packed/tree lowering
+  // in reduceWithinThreads unchanged when TRITON_LLVM_VECTORIZE is disabled.
+  std::pair<LinearLayout, SmallVector<SmallVector<Value>>>
+  reduceWithinThreadsVectorized(triton::ReduceOp op, LinearLayout layout,
+                      SmallVector<SmallVector<Value>> accs,
+                      ConversionPatternRewriter &rewriter) const {
+    auto *ctx = op.getContext();
+    auto loc = op.getLoc();
+    unsigned axis = op.getAxis();
+    auto kReg = str_attr("register");
+    auto linearAttr = triton::gpu::LinearEncodingAttr::get(ctx, layout);
+    auto basesPerDim = linearAttr.basesPerDim(kReg, /*skipBroadcast=*/true);
+    unsigned axisPack = basesPerDim[axis];
+    if (axisPack == 1) {
+      return {std::move(layout), std::move(accs)};
+    }
+
+    // Keep every local group contiguous, including when independent outputs
+    // were originally interleaved in the register layout.
+    auto perm = ReduceOpHelper::moveAxisBasesToFront(layout, axis, false);
+    if (!perm.isIdentity()) {
+      layout = perm.apply(layout);
+      for (auto &vals : accs) {
+        vals = perm.apply(vals);
+      }
+    }
+
+    Operation *combinerOp = op.getSingleCombiner();
+    unsigned arity =
+        combinerOp ? targetInfo.getReductionTreeArity(combinerOp) : 2;
+
+    Region &combineRegion = op.getCombineOp();
+    // Extra operations in the combiner region may have observable effects.
+    bool isPureBooleanCombiner =
+        isa_and_nonnull<arith::AndIOp, arith::OrIOp, arith::XOrIOp,
+                        arith::MinSIOp, arith::MaxSIOp, arith::MinUIOp,
+                        arith::MaxUIOp>(combinerOp) &&
+        combinerOp->getResult(0).getType().isInteger(1) &&
+        llvm::hasSingleElement(combineRegion.front().without_terminator());
+    bool usePredicateChains =
+        isPureBooleanCombiner && targetInfo.preferThreePredicateChains();
+
+    // Prefer a full-width vector reduction for a simple builtin combiner.
+    unsigned numOperands = accs.size();
+    SmallVector<SmallVector<Value>> reduced(numOperands);
+    unsigned regs = accs.front().size();
+    for (unsigned regBase = 0; regBase < regs; regBase += axisPack) {
+      if (numOperands == 1 && !usePredicateChains) {
+        auto values = ArrayRef<Value>(accs.front()).slice(regBase, axisPack);
+        if (Value result = tryVectorReduction(op, values, rewriter)) {
+          reduced.front().push_back(result);
+          continue;
+        }
+      }
+      // Custom and tuple combiners retain the original tree reduction.
+      // Transpose from [opIdx][reg] into [reg][opIdx]
+      SmallVector<SmallVector<Value>> vals;
+      for (unsigned i = 0; i < axisPack; ++i) {
+        SmallVector<Value> cur(numOperands);
+        for (unsigned opIdx = 0; opIdx < numOperands; ++opIdx) {
+          cur[opIdx] = accs[opIdx][regBase + i];
+        }
+        if (usePredicateChains && i >= 3)
+          accumulate(loc, rewriter, combineRegion, vals[i % 3], cur);
+        else
+          vals.push_back(std::move(cur));
+      }
+      auto acc =
+          treeReduce(loc, rewriter, op.getCombineOp(), std::move(vals), arity);
+      for (unsigned opIdx = 0; opIdx < numOperands; ++opIdx) {
+        reduced[opIdx].push_back(acc[opIdx]);
+      }
+    }
+    accs = std::move(reduced);
+
+    // Update the layout, killing the axis bases along registers.
+    layout = ReduceOpHelper::zeroBasesAlongDimAndReorder(layout, axis, kReg);
+    layout = layout.removeZeroBasesAlongDim(kReg);
+    return {std::move(layout), std::move(accs)};
+  }
+
   // Reduce along the op axis for elements that are in the same thread. The
   // accumulated value is stored in accs.
   std::pair<LinearLayout, SmallVector<SmallVector<Value>>>
   reduceWithinThreads(triton::ReduceOp op, LinearLayout layout,
                       SmallVector<SmallVector<Value>> accs,
                       ConversionPatternRewriter &rewriter) const {
+    if (triton::tools::getBoolEnv("TRITON_LLVM_VECTORIZE"))
+      return reduceWithinThreadsVectorized(op, std::move(layout),
+                                           std::move(accs), rewriter);
+
     auto *ctx = op.getContext();
     auto loc = op.getLoc();
     unsigned axis = op.getAxis();
