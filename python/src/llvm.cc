@@ -496,6 +496,17 @@ void init_triton_llvm(py::module_ &m) {
            [](llvm::Function *fn, std::string &val) {
              fn->addFnAttr("target-features", val);
            })
+      // Sets the reqd_work_group_size metadata on the given function.
+      .def("set_reqd_work_group_size",
+           [](llvm::Function *fn, uint32_t x, uint32_t y, uint32_t z) {
+             auto &ctx = fn->getContext();
+             auto dim = [&](uint32_t v) -> llvm::Metadata * {
+               return ConstantAsMetadata::get(
+                   ConstantInt::get(Type::getInt32Ty(ctx), v));
+             };
+             fn->setMetadata("reqd_work_group_size",
+                             MDNode::get(ctx, {dim(x), dim(y), dim(z)}));
+           })
       // Sets the nvvm.maxreg property on the given function.
       .def("set_nvvm_maxnreg",
            [](llvm::Function *fn, int maxnreg) {

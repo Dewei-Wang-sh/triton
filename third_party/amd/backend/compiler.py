@@ -790,7 +790,12 @@ class HIPBackend(BaseBackend):
         total_num_warps = src.get_int_attr("ttg.total-num-warps")
         if total_num_warps is not None:
             total_warps_num = total_num_warps
-        kernel_fn.add_fn_attr("amdgpu-flat-work-group-size", f"1,{total_warps_num*options.warp_size}")
+        # Triton always launches one-dimensional workgroups of exactly this size.
+        # Stating it lets LLVM lower llvm.amdgcn.wave.id from workitem.id.x. The
+        # verifier requires the flat size to equal the reqd_work_group_size product.
+        workgroup_size = total_warps_num * options.warp_size
+        kernel_fn.add_fn_attr("amdgpu-flat-work-group-size", f"{workgroup_size},{workgroup_size}")
+        kernel_fn.set_reqd_work_group_size(workgroup_size, 1, 1)
         kernel_fn.add_fn_attr("uniform-work-group-size", "true")
         # "amdgpu-waves-per-eu"="<min>[,<max>]" allows controlling the minimal and (optional)
         # maximal number of waves per SIMD. If <max> is omitted, then no restriction other than
