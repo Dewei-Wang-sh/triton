@@ -87,6 +87,13 @@ struct BufferEmitter {
                                                   Value soffsetBytes, Value dst,
                                                   Value pred, int32_t aux);
 
+  // Same as emitLoadToLds, but the caller passes the final per-lane byte
+  // offset, already scaled to bytes and with masked lanes set out of bounds.
+  ROCDL::RawPtrBufferLoadAsyncLdsOp
+  emitLoadToLdsWithMaskedByteOffset(Value byteWidth, Value rsrcDesc,
+                                    Value maskedOffsetBytes,
+                                    Value soffsetBytes, Value dst, int32_t aux);
+
   // Emit a predicated rocdl.raw.ptr.buffer.atomic.* RMWOp
   Value emitAtomicRMW(RMWOp rmwType, Type type, Value rsrcDesc, Value offset,
                       Value data, Value pred, bool hasUsers);

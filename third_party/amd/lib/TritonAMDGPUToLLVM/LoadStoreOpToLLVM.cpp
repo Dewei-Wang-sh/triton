@@ -19,6 +19,7 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 
 using namespace mlir;
 using namespace mlir::triton::gpu;
@@ -963,16 +964,78 @@ struct BufferLoadToLocalOpConversion
         isRedundantThreadPredWarpUniform(freeVarMasks, rewriter.getContext());
 
     auto laneId = getLaneId(rewriter, loc);
+
+    // With TRITON_LLVM_VECTORIZE, compute every instruction's masked byte
+    // offset as one vector before the first load, instead of a scalar
+    // mul + select per instruction. The packed offsets and masks also give the
+    // LLVM vectorize pass a seed for the address and mask arithmetic feeding
+    // them. Only the warp-uniform, no-other, unswizzled path is handled.
+    bool vectorizeOffsets = triton::tools::getBoolEnv("TRITON_LLVM_VECTORIZE") &&
+                            isThreadPredWarpUniform && !hasOther &&
+                            !requiresSrcPtrSwizzling;
+    DenseMap<int, Value> maskedOffsetByStartIdx;
+    auto emitVectorMaskedOffsets = [&](RewriterBase &rewriter, Location loc,
+                                       ArrayRef<Value> loadVals,
+                                       VectorType vecTy) {
+      unsigned groupSize = vecTy.getNumElements();
+      SmallVector<int> startIdxs;
+      for (unsigned i = 0; i < loadVals.size(); i += groupSize)
+        startIdxs.push_back(i);
+      int64_t n = startIdxs.size();
+      auto offVecTy = VectorType::get({n}, offsetTy);
+      auto maskVecTy = VectorType::get({n}, i1_ty);
+      Value offVec = LLVM::UndefOp::create(rewriter, loc, offVecTy);
+      Value maskVec = LLVM::UndefOp::create(rewriter, loc, maskVecTy);
+      for (auto [lane, startIdx] : llvm::enumerate(startIdxs)) {
+        auto [offsetElem, maskElem, otherElems, swizzleLaneOffset] =
+            unzipAsyncCopyValues(rewriter, loc, startIdx, loadVals, offsetTy,
+                                 otherTy, hasOther, groupSize);
+        offVec = b.insert_element(offVecTy, offVec, offsetElem,
+                                  b.i32_val(lane));
+        maskVec = b.insert_element(maskVecTy, maskVec, maskElem,
+                                   b.i32_val(lane));
+      }
+      // Same constants as BufferEmitter::fillCommonArgs.
+      int elemBytes =
+          std::max(8u, vecTy.getElementType().getIntOrFloatBitWidth()) / 8;
+      auto splat = [&](int32_t v) -> Value {
+        return LLVM::ConstantOp::create(
+            rewriter, loc, offVecTy,
+            DenseElementsAttr::get(offVecTy, rewriter.getI32IntegerAttr(v)));
+      };
+      Value bytes = LLVM::MulOp::create(rewriter, loc, offVec, splat(elemBytes));
+      Value masked =
+          LLVM::SelectOp::create(rewriter, loc, maskVec, bytes, splat(-1));
+      for (auto [lane, startIdx] : llvm::enumerate(startIdxs))
+        maskedOffsetByStartIdx[startIdx] =
+            b.extract_element(offsetTy, masked, b.i32_val(lane));
+    };
+
     auto emitBufferLoadLds = [&](RewriterBase &rewriter, Location loc,
                                  ArrayRef<Value> loadVals, Value shmemAddr,
                                  int startIdx, VectorType vecTy,
                                  Value multicastMask) -> SmallVector<Value> {
-      auto [offsetElem, maskElem, otherElems, swizzleLaneOffset] =
-          unzipAsyncCopyValues(rewriter, loc, startIdx, loadVals, offsetTy,
-                               otherTy, hasOther, vecTy.getNumElements());
       int vecBits = vecTy.getNumElements() * vecTy.getElementTypeBitWidth();
       assert(targetInfo.supportsDirectToLdsLoadBitWidth(vecBits));
       Value vecBytesVal = b.i32_val(vecBits / 8);
+      if (vectorizeOffsets) {
+        if (maskedOffsetByStartIdx.empty())
+          emitVectorMaskedOffsets(rewriter, loc, loadVals, vecTy);
+        auto it = maskedOffsetByStartIdx.find(startIdx);
+        assert(it != maskedOffsetByStartIdx.end() &&
+               "unexpected direct-to-LDS start index");
+        Value predicatedAddress =
+            selectLdsAddressForPredicate(b, threadPred, shmemAddr);
+        auto bufferLoadToLds = bufferEmitter.emitLoadToLdsWithMaskedByteOffset(
+            vecBytesVal, rsrcDesc, it->second, soffsetBytes, predicatedAddress,
+            *aux);
+        if (targetInfo.requiresAliasInfoForAsyncOps())
+          AMD::addAsyncCopyAliasScope(bufferLoadToLds);
+        return {};
+      }
+      auto [offsetElem, maskElem, otherElems, swizzleLaneOffset] =
+          unzipAsyncCopyValues(rewriter, loc, startIdx, loadVals, offsetTy,
+                               otherTy, hasOther, vecTy.getNumElements());
 
       Value maybeSwizzledMaskElem = maskElem;
       if (requiresSrcPtrSwizzling)

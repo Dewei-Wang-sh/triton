@@ -3,6 +3,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LLVM.h"
@@ -64,6 +65,157 @@ void rewriteExp2WithFlushMode(ModuleOp module) {
       op.erase();
     });
   });
+}
+
+// Replace `load <1 x T>` whose only users are `extractelement 0` with a scalar
+// `load T`. Lowerings emit `vector<vec x T>` loads even for vec = 1; the scalar
+// form is the same access. Volatile and atomic loads are left alone. The clone
+// keeps alignment, address space and alias/nontemporal/invariant metadata.
+void scalarizeSingleElementLoads(ModuleOp module) {
+  SmallVector<LLVM::LoadOp> loads;
+  module.walk([&](LLVM::LoadOp load) {
+    auto vecTy = dyn_cast<VectorType>(load.getType());
+    if (!vecTy || vecTy.getNumElements() != 1 || vecTy.isScalable() ||
+        load.getVolatile_() ||
+        load.getOrdering() != LLVM::AtomicOrdering::not_atomic)
+      return;
+    bool onlyExtractZero = llvm::all_of(load->getUsers(), [](Operation *user) {
+      auto extract = dyn_cast<LLVM::ExtractElementOp>(user);
+      APInt index;
+      return extract &&
+             matchPattern(extract.getPosition(), m_ConstantInt(&index)) &&
+             index.isZero();
+    });
+    if (onlyExtractZero && !load->use_empty())
+      loads.push_back(load);
+  });
+  for (LLVM::LoadOp load : loads) {
+    OpBuilder builder(load);
+    Operation *scalar = builder.clone(*load);
+    scalar->getResult(0).setType(
+        cast<VectorType>(load.getType()).getElementType());
+    for (Operation *user : llvm::make_early_inc_range(load->getUsers())) {
+      user->getResult(0).replaceAllUsesWith(scalar->getResult(0));
+      user->erase();
+    }
+    load.erase();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reassociate a constant vector offset outward:
+//   add(A, op(S, C)) -> add(add(A, S), C),  op in {add, or, xor}, C constant
+// For or/xor this needs S and C to share no set bits, so that op(S, C) equals
+// S + C. Example from the MLA loop: the token index of each async copy is
+//   start_n + (cur_head ^ <0, 8, 4, ..., 28>),  cur_head = (x & 192) >> 6.
+// LLVM hoists the loop-invariant (cur_head ^ C) out of the loop and then keeps
+// one SGPR per lane live across the loop. For scalar code, LLVM's straight-line
+// strength reduction rewrites it into base + immediate, but it does not handle
+// vectors. With C outermost, each lane becomes base + immediate again.
+//
+// This is a code-simplification pattern rather than vectorization. It lives in
+// this pass for now because only the vectorized form needs it.
+// ---------------------------------------------------------------------------
+
+// Bits known to be zero in `v`, through a few shape-preserving ops.
+APInt knownZeroBits(Value v, unsigned depth = 0) {
+  auto intTy = dyn_cast<IntegerType>(getElementTypeOrSelf(v.getType()));
+  if (!intTy)
+    return APInt();
+  unsigned bw = intTy.getWidth();
+  APInt none(bw, 0);
+  APInt cst;
+  if (matchPattern(v, m_ConstantInt(&cst)))
+    return ~cst;
+  Operation *op = v.getDefiningOp();
+  if (!op || depth > 8)
+    return none;
+  auto operandZero = [&](unsigned i) {
+    APInt kz = knownZeroBits(op->getOperand(i), depth + 1);
+    return kz.getBitWidth() == bw ? kz : none;
+  };
+  // splat: insertelement into lane 0, then a zero-mask shuffle.
+  if (auto shuffle = dyn_cast<LLVM::ShuffleVectorOp>(op)) {
+    if (llvm::all_of(shuffle.getMask(), [](int i) { return i == 0; }))
+      if (auto insert = shuffle.getV1().getDefiningOp<LLVM::InsertElementOp>())
+        if (matchPattern(insert.getPosition(), m_Zero())) {
+          APInt kz = knownZeroBits(insert.getValue(), depth + 1);
+          return kz.getBitWidth() == bw ? kz : none;
+        }
+    return none;
+  }
+  if (isa<LLVM::AndOp>(op))
+    return operandZero(0) | operandZero(1);
+  if (isa<LLVM::OrOp, LLVM::XOrOp>(op))
+    return operandZero(0) & operandZero(1);
+  APInt amount;
+  if (op->getNumOperands() == 2 &&
+      matchPattern(op->getOperand(1), m_ConstantInt(&amount)) &&
+      amount.ult(bw)) {
+    unsigned k = amount.getZExtValue();
+    if (isa<LLVM::LShrOp>(op))
+      return operandZero(0).lshr(k) | APInt::getHighBitsSet(bw, k);
+    if (isa<LLVM::ShlOp>(op))
+      return operandZero(0).shl(k) | APInt::getLowBitsSet(bw, k);
+  }
+  return none;
+}
+
+// Look through `add X, 0`.
+Value stripAddZero(Value v) {
+  while (auto add = v.getDefiningOp<LLVM::AddOp>()) {
+    if (matchPattern(add.getRhs(), m_Zero()))
+      v = add.getLhs();
+    else if (matchPattern(add.getLhs(), m_Zero()))
+      v = add.getRhs();
+    else
+      break;
+  }
+  return v;
+}
+
+bool isConstantVector(Value v) {
+  return isa<VectorType>(v.getType()) && matchPattern(v, m_Constant());
+}
+
+void reassociateConstantVectorOffsets(ModuleOp module) {
+  SmallVector<LLVM::AddOp> adds;
+  module.walk([&](LLVM::AddOp add) {
+    if (isa<VectorType>(add.getType()))
+      adds.push_back(add);
+  });
+  for (LLVM::AddOp add : adds) {
+    for (unsigned side = 0; side < 2; ++side) {
+      Value other = add->getOperand(1 - side);
+      Operation *inner = stripAddZero(add->getOperand(side)).getDefiningOp();
+      if (!inner || !isa<LLVM::AddOp, LLVM::OrOp, LLVM::XOrOp>(inner) ||
+          isConstantVector(other))
+        continue;
+      Value s = inner->getOperand(0), c = inner->getOperand(1);
+      if (isConstantVector(s))
+        std::swap(s, c);
+      if (!isConstantVector(c) || isConstantVector(s))
+        continue;
+      if (!isa<LLVM::AddOp>(inner)) {
+        auto dense = dyn_cast<DenseIntElementsAttr>(
+            cast<LLVM::ConstantOp>(c.getDefiningOp()).getValue());
+        if (!dense)
+          continue;
+        APInt setBits(dense.getElementType().getIntOrFloatBitWidth(), 0);
+        for (const APInt &e : dense.getValues<APInt>())
+          setBits |= e;
+        APInt kz = knownZeroBits(s);
+        if (kz.getBitWidth() != setBits.getBitWidth() || !setBits.isSubsetOf(kz))
+          continue;
+      }
+      OpBuilder b(add);
+      Value sum = LLVM::AddOp::create(b, add.getLoc(), other, s);
+      Value result = LLVM::AddOp::create(b, add.getLoc(), sum, c);
+      add.getResult().replaceAllUsesWith(result);
+      add.erase();
+      break;
+    }
+  }
 }
 
 // Keep the intrinsic's aggregate result and its scalar extractions together.
@@ -154,6 +306,11 @@ public:
       auto pos = op.getPosition();
       assert(pos.size() == 1 &&
              "Only single index insertvalue is supported in this pass");
+      // A one-element tuple becomes its scalar: the value replaces it.
+      if (!isa<VectorType>(newTy)) {
+        rewriter.replaceOp(op, adaptor.getValue());
+        return success();
+      }
       Value newPos = LLVM::ConstantOp::create(rewriter, op.getLoc(),
                                               rewriter.getI32Type(), pos[0]);
       rewriter.replaceOpWithNewOp<LLVM::InsertElementOp>(
@@ -178,6 +335,11 @@ public:
       auto pos = op.getPosition();
       assert(pos.size() == 1 &&
              "Only single index insertvalue is supported in this pass");
+      // A one-element tuple is already the scalar.
+      if (!isa<VectorType>(newTy)) {
+        rewriter.replaceOp(op, adaptor.getContainer());
+        return success();
+      }
       Value newPos = LLVM::ConstantOp::create(rewriter, op.getLoc(),
                                               rewriter.getI32Type(), pos[0]);
       rewriter.replaceOpWithNewOp<LLVM::ExtractElementOp>(
@@ -722,8 +884,10 @@ public:
     mlir::TypeConverter converter;
     converter.addConversion([](Type type) { return type; });
     converter.addConversion([](LLVM::LLVMStructType type) -> Type {
+      // A one-element tuple maps to its scalar, not to a one-element vector.
       if (auto vectorType = getNumericTupleVectorType(type))
-        return vectorType;
+        return vectorType.getNumElements() == 1 ? vectorType.getElementType()
+                                                : Type(vectorType);
       return type;
     });
     // General tuple/vector boundary adapters are disabled. Intrinsic calls
@@ -757,6 +921,8 @@ public:
 
     // llvm::dbgs() << "Module after struct to vector convert: " << m << "\n";
 
+    scalarizeSingleElementLoads(m);
+
     // step 2: iteratively vectorize ops from insertelement chains
     SmallVector<LLVM::InsertElementOp> insertOps;
     auto funcOps = m.getOps<LLVM::LLVMFuncOp>();
@@ -768,6 +934,9 @@ public:
       if (!visitedInsert.contains(insert))
         (void)tryVectorizeInsertChain(insert, visitedInsert);
     }
+    // Not vectorization: keep constant vector offsets outermost (see above).
+    reassociateConstantVectorOffsets(m);
+
     // step 3: canonicalize after vectorization
     OpPassManager pm;
     pm.addPass(mlir::createCanonicalizerPass());

@@ -153,6 +153,20 @@ BufferEmitter::emitLoadToLds(Type type, Value byteWidth, Value rsrcDesc,
       /*noalias_scopes=*/nullptr, /*tbaa=*/nullptr);
 }
 
+ROCDL::RawPtrBufferLoadAsyncLdsOp
+BufferEmitter::emitLoadToLdsWithMaskedByteOffset(Value byteWidth,
+                                                 Value rsrcDesc,
+                                                 Value maskedOffsetBytes,
+                                                 Value soffsetBytes, Value dst,
+                                                 int32_t aux) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value sgprOffset = soffsetBytes ? soffsetBytes : b.int_val(32, 0);
+  return ROCDL::RawPtrBufferLoadAsyncLdsOp::create(
+      rewriter, loc, rsrcDesc, dst, byteWidth, maskedOffsetBytes, sgprOffset,
+      b.i32_val(0), rewriter.getI32IntegerAttr(aux), /*alias_scopes=*/nullptr,
+      /*noalias_scopes=*/nullptr, /*tbaa=*/nullptr);
+}
+
 Value BufferEmitter::emitAtomicCAS(Type type, Value rsrcDesc, Value offset,
                                    Value casCmpVal, Value casStoreVal,
                                    Value pred, bool hasUsers) {

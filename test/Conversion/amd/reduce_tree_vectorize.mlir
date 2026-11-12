@@ -367,12 +367,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
 // LLVM-VECTORIZE: #[[$LOOP:.*]] = #llvm.loop_annotation<disableNonforced = false, mustProgress = true>
 #loop = #llvm.loop_annotation<disableNonforced = false, mustProgress = true>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
-  // A merge reached by both br and cond_br must receive vectors on both edges.
+  // A merge reached by both br and cond_br must receive the converted type on
+  // both edges. A one-element tuple converts to its scalar, not vector<1xf32>.
   // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_mixed_predecessors
-  // LLVM-VECTORIZE: llvm.cond_br %arg0, ^{{.*}}, ^[[MERGE:bb[0-9]+]]({{.*}} : vector<1xf32>)
-  // LLVM-VECTORIZE: llvm.br ^[[MERGE]]({{.*}} : vector<1xf32>)
-  // LLVM-VECTORIZE: ^[[MERGE]](%[[MERGED:.*]]: vector<1xf32>):
-  // LLVM-VECTORIZE: llvm.extractelement %[[MERGED]][{{.*}}] : vector<1xf32>
+  // LLVM-VECTORIZE: llvm.cond_br %arg0, ^{{.*}}, ^[[MERGE:bb[0-9]+]]({{.*}} : f32)
+  // LLVM-VECTORIZE: llvm.br ^[[MERGE]](%arg2 : f32)
+  // LLVM-VECTORIZE: ^[[MERGE]](%[[MERGED:.*]]: f32):
+  // LLVM-VECTORIZE: llvm.return %[[MERGED]] : f32
   llvm.func @vectorize_mixed_predecessors(%condition: i1, %x: f32, %y: f32) -> f32 {
     %u = llvm.mlir.undef : !llvm.struct<(f32)>
     %initial = llvm.insertvalue %x, %u[0] : !llvm.struct<(f32)>
@@ -390,14 +391,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
   // Convert both conditional destinations, keep scalar arguments, and preserve
   // branch weights and the loop annotation on the unconditional backedge.
   // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_tuple_loop
-  // LLVM-VECTORIZE: llvm.br ^[[HEADER:bb[0-9]+]]({{.*}} : vector<1xf32>, i32)
-  // LLVM-VECTORIZE: ^[[HEADER]](%[[CARRIED:.*]]: vector<1xf32>, %[[ITER:.*]]: i32):
-  // LLVM-VECTORIZE: llvm.cond_br %{{.*}} weights([9, 1]), ^[[BODY:bb[0-9]+]](%[[CARRIED]], %[[ITER]] : vector<1xf32>, i32), ^[[EXIT:bb[0-9]+]](%[[CARRIED]] : vector<1xf32>)
-  // LLVM-VECTORIZE: ^[[BODY]](%[[VALUE:.*]]: vector<1xf32>, %{{.*}}: i32):
-  // LLVM-VECTORIZE: llvm.extractelement %[[VALUE]][{{.*}}] : vector<1xf32>
-  // LLVM-VECTORIZE: llvm.br ^[[HEADER]]({{.*}} : vector<1xf32>, i32) loop_annotation = #[[$LOOP]]
-  // LLVM-VECTORIZE: ^[[EXIT]](%[[RESULT:.*]]: vector<1xf32>):
-  // LLVM-VECTORIZE: llvm.extractelement %[[RESULT]][{{.*}}] : vector<1xf32>
+  // LLVM-VECTORIZE: llvm.br ^[[HEADER:bb[0-9]+]]({{.*}} : f32, i32)
+  // LLVM-VECTORIZE: ^[[HEADER]](%[[CARRIED:.*]]: f32, %[[ITER:.*]]: i32):
+  // LLVM-VECTORIZE: llvm.cond_br %{{.*}} weights([9, 1]), ^[[BODY:bb[0-9]+]](%[[CARRIED]], %[[ITER]] : f32, i32), ^[[EXIT:bb[0-9]+]](%[[CARRIED]] : f32)
+  // LLVM-VECTORIZE: ^[[BODY]](%[[VALUE:.*]]: f32, %{{.*}}: i32):
+  // LLVM-VECTORIZE: llvm.fadd %[[VALUE]], %arg0 : f32
+  // LLVM-VECTORIZE: llvm.br ^[[HEADER]]({{.*}} : f32, i32) loop_annotation = #[[$LOOP]]
+  // LLVM-VECTORIZE: ^[[EXIT]](%[[RESULT:.*]]: f32):
+  // LLVM-VECTORIZE: llvm.return %[[RESULT]] : f32
   llvm.func @vectorize_tuple_loop(%x: f32, %count: i32) -> f32 {
     %zero = llvm.mlir.constant(0 : i32) : i32
     %one = llvm.mlir.constant(1 : i32) : i32
@@ -420,11 +421,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
 
   // A conditional backedge uses a signature already converted by the entry br.
   // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_conditional_backedge
-  // LLVM-VECTORIZE: llvm.br ^[[HEADER:bb[0-9]+]]({{.*}} : vector<1xf32>, i32)
-  // LLVM-VECTORIZE: ^[[HEADER]](%{{.*}}: vector<1xf32>, %{{.*}}: i32):
-  // LLVM-VECTORIZE: llvm.cond_br %{{.*}} weights([7, 1]), ^[[HEADER]](%[[NEXT:.*]], %{{.*}} : vector<1xf32>, i32), ^[[EXIT:bb[0-9]+]](%[[NEXT]] : vector<1xf32>) loop_annotation = #[[$LOOP]]
-  // LLVM-VECTORIZE: ^[[EXIT]](%[[RESULT:.*]]: vector<1xf32>):
-  // LLVM-VECTORIZE: llvm.extractelement %[[RESULT]][{{.*}}] : vector<1xf32>
+  // LLVM-VECTORIZE: llvm.br ^[[HEADER:bb[0-9]+]]({{.*}} : f32, i32)
+  // LLVM-VECTORIZE: ^[[HEADER]](%{{.*}}: f32, %{{.*}}: i32):
+  // LLVM-VECTORIZE: llvm.cond_br %{{.*}} weights([7, 1]), ^[[HEADER]](%[[NEXT:.*]], %{{.*}} : f32, i32), ^[[EXIT:bb[0-9]+]](%[[NEXT]] : f32) loop_annotation = #[[$LOOP]]
+  // LLVM-VECTORIZE: ^[[EXIT]](%[[RESULT:.*]]: f32):
+  // LLVM-VECTORIZE: llvm.return %[[RESULT]] : f32
   llvm.func @vectorize_conditional_backedge(%x: f32, %count: i32) -> f32 {
     %zero = llvm.mlir.constant(0 : i32) : i32
     %one = llvm.mlir.constant(1 : i32) : i32
@@ -446,11 +447,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
   // Both edges target the same block but forward different values. Convert its
   // signature once and retain the correct operand list for each edge.
   // LLVM-VECTORIZE-LABEL: llvm.func @vectorize_shared_successor
-  // LLVM-VECTORIZE: %[[TRUE:.*]] = llvm.insertelement %arg1, {{.*}} : vector<1xf32>
-  // LLVM-VECTORIZE: %[[FALSE:.*]] = llvm.insertelement %arg2, {{.*}} : vector<1xf32>
-  // LLVM-VECTORIZE: llvm.cond_br %arg0 weights([3, 2]), ^[[MERGE:bb[0-9]+]](%[[TRUE]] : vector<1xf32>), ^[[MERGE]](%[[FALSE]] : vector<1xf32>)
-  // LLVM-VECTORIZE: ^[[MERGE]](%[[MERGED:.*]]: vector<1xf32>):
-  // LLVM-VECTORIZE: llvm.extractelement %[[MERGED]][{{.*}}] : vector<1xf32>
+  // LLVM-VECTORIZE: llvm.cond_br %arg0 weights([3, 2]), ^[[MERGE:bb[0-9]+]](%arg1 : f32), ^[[MERGE]](%arg2 : f32)
+  // LLVM-VECTORIZE: ^[[MERGE]](%[[MERGED:.*]]: f32):
+  // LLVM-VECTORIZE: llvm.return %[[MERGED]] : f32
   llvm.func @vectorize_shared_successor(%condition: i1, %x: f32, %y: f32) -> f32 {
     %u = llvm.mlir.undef : !llvm.struct<(f32)>
     %true_value = llvm.insertvalue %x, %u[0] : !llvm.struct<(f32)>
@@ -865,5 +864,76 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     %field = llvm.extractvalue %pair[1] : !llvm.struct<(i32, i32)>
     llvm.store %field, %out : i32, !llvm.ptr
     llvm.return %sum : f32
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // A <1 x T> load whose only use is element 0 becomes a scalar load. The clone
+  // keeps the load's attributes.
+  // LLVM-VECTORIZE-LABEL: llvm.func @scalarize_single_element_load
+  // LLVM-VECTORIZE: %[[L:.*]] = llvm.load %arg0 <alignment = 4> : !llvm.ptr<3> -> i32
+  // LLVM-VECTORIZE-NOT: llvm.extractelement
+  // LLVM-VECTORIZE: llvm.return %[[L]] : i32
+  llvm.func @scalarize_single_element_load(%ptr: !llvm.ptr<3>) -> i32 {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %v = llvm.load %ptr <alignment = 4> : !llvm.ptr<3> -> vector<1xi32>
+    %e = llvm.extractelement %v[%c0 : i32] : vector<1xi32>
+    llvm.return %e : i32
+  }
+
+  // Volatile loads, and loads with a non-extract use, stay as they are.
+  // LLVM-VECTORIZE-LABEL: llvm.func @keep_single_element_load
+  // LLVM-VECTORIZE: llvm.load volatile %arg0 {{.*}} -> vector<1xi32>
+  // LLVM-VECTORIZE: llvm.load %arg0 {{.*}} -> vector<1xi32>
+  llvm.func @keep_single_element_load(%ptr: !llvm.ptr<3>, %out: !llvm.ptr<3>) -> i32 {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %v = llvm.load volatile %ptr <alignment = 4> : !llvm.ptr<3> -> vector<1xi32>
+    %e = llvm.extractelement %v[%c0 : i32] : vector<1xi32>
+    %w = llvm.load %ptr <alignment = 4> : !llvm.ptr<3> -> vector<1xi32>
+    llvm.store %w, %out : vector<1xi32>, !llvm.ptr<3>
+    llvm.return %e : i32
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // add(A, xor(S, C)) becomes add(add(A, S), C) when S and C share no set bits,
+  // so the constant vector offset stays outermost: S = (x & 192) >> 6 uses only
+  // bits 0-1, C only bits 2-4.
+  // LLVM-VECTORIZE-LABEL: llvm.func @reassociate_constant_vector_offset
+  // LLVM-VECTORIZE: %[[C:.*]] = llvm.mlir.constant(dense<[0, 8, 4, 12]> : vector<4xi32>)
+  // LLVM-VECTORIZE: %[[SUM:.*]] = llvm.add %{{.*}}, %{{.*}} : vector<4xi32>
+  // LLVM-VECTORIZE: llvm.add %[[SUM]], %[[C]] : vector<4xi32>
+  // LLVM-VECTORIZE-NOT: llvm.xor
+  llvm.func @reassociate_constant_vector_offset(%a: vector<4xi32>, %x: i32) -> vector<4xi32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %m = llvm.mlir.constant(192 : i32) : i32
+    %k = llvm.mlir.constant(6 : i32) : i32
+    %c = llvm.mlir.constant(dense<[0, 8, 4, 12]> : vector<4xi32>) : vector<4xi32>
+    %u = llvm.mlir.undef : vector<4xi32>
+    %and = llvm.and %x, %m : i32
+    %s = llvm.lshr %and, %k : i32
+    %ins = llvm.insertelement %s, %u[%c0 : i32] : vector<4xi32>
+    %splat = llvm.shufflevector %ins, %u [0, 0, 0, 0] : vector<4xi32>
+    %off = llvm.xor %splat, %c : vector<4xi32>
+    %r = llvm.add %a, %off : vector<4xi32>
+    llvm.return %r : vector<4xi32>
+  }
+
+  // Without the disjointness proof, xor is not an add: leave it alone.
+  // LLVM-VECTORIZE-LABEL: llvm.func @keep_overlapping_xor_offset
+  // LLVM-VECTORIZE: llvm.xor
+  llvm.func @keep_overlapping_xor_offset(%a: vector<4xi32>, %x: i32) -> vector<4xi32> {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %c = llvm.mlir.constant(dense<[0, 8, 4, 12]> : vector<4xi32>) : vector<4xi32>
+    %u = llvm.mlir.undef : vector<4xi32>
+    %ins = llvm.insertelement %x, %u[%c0 : i32] : vector<4xi32>
+    %splat = llvm.shufflevector %ins, %u [0, 0, 0, 0] : vector<4xi32>
+    %off = llvm.xor %splat, %c : vector<4xi32>
+    %r = llvm.add %a, %off : vector<4xi32>
+    llvm.return %r : vector<4xi32>
   }
 }
