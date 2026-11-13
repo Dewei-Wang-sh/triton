@@ -1721,6 +1721,7 @@ Attribute AMDWmmaEncodingAttr::parse(AsmParser &parser, Type type) {
   unsigned rank = 2;
   bool isTransposed = false;
   SmallVector<unsigned> instrShape = getDefaultInstrShape();
+  SmallVector<unsigned> kWarp;
   Attribute cgaAttr = nullptr;
   Attribute warpLayAttr = nullptr;
 
@@ -1750,6 +1751,10 @@ Attribute AMDWmmaEncodingAttr::parse(AsmParser &parser, Type type) {
       if (parseIntArrayAttr(parser, attr, instrShape, "instrShape").failed()) {
         return {};
       }
+    }
+    if (attr.getName() == "kWarp") {
+      if (parseIntArrayAttr(parser, attr, kWarp, "kWarp").failed())
+        return {};
     }
   }
 
@@ -1788,7 +1793,7 @@ Attribute AMDWmmaEncodingAttr::parse(AsmParser &parser, Type type) {
 
   return parser.getChecked<AMDWmmaEncodingAttr>(parser.getContext(), version,
                                                 std::move(ctaLL), isTransposed,
-                                                *CGALayout, instrShape);
+                                                *CGALayout, instrShape, kWarp);
 }
 
 void AMDWmmaEncodingAttr::print(AsmPrinter &printer) const {
@@ -1805,6 +1810,8 @@ void AMDWmmaEncodingAttr::print(AsmPrinter &printer) const {
   if (getInstrShape() != ArrayRef(getDefaultInstrShape())) {
     printer << ", instrShape = [" << getInstrShape() << "]";
   }
+  if (hasKWarp())
+    printer << ", kWarp = [" << getKWarp() << "]";
   printer << "}>";
 }
 
@@ -1812,9 +1819,18 @@ LogicalResult
 AMDWmmaEncodingAttr::verify(function_ref<mlir::InFlightDiagnostic()> emitError,
                             unsigned version, LinearLayout ctaLayout,
                             bool isTransposed, CGAEncodingAttr cgaLayout,
-                            llvm::ArrayRef<unsigned> instrShape) {
+                            llvm::ArrayRef<unsigned> instrShape,
+                            llvm::ArrayRef<unsigned> kWarp) {
   if (!(version >= 1 && version <= 3))
     return emitError() << "WMMA version must be in the [1, 3] range";
+  if (!kWarp.empty()) {
+    auto kWarpDim = StringAttr::get(cgaLayout.getContext(), "warp");
+    unsigned numWarpBits = ctaLayout.hasInDim(kWarpDim)
+                               ? ctaLayout.getInDimSizeLog2(kWarpDim)
+                               : 0;
+    if (kWarp.size() != numWarpBits)
+      return emitError() << "kWarp must have one entry per warp basis";
+  }
 
   auto shape = SmallVector<unsigned>(instrShape);
   auto validShapesV1 = std::vector<llvm::SmallVector<unsigned>>{{16, 16, 16}};
@@ -2872,7 +2888,8 @@ bool AMDWmmaEncodingAttr::isEqualIgnoringCGALayout(
   return getVersion() == other.getVersion() &&
          getCtaLayout() == other.getCtaLayout() &&
          getInstrShape() == other.getInstrShape() &&
-         getIsTransposed() == other.getIsTransposed();
+         getIsTransposed() == other.getIsTransposed() &&
+         getKWarp() == other.getKWarp();
 }
 
 //===----------------------------------------------------------------------===//
