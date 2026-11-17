@@ -4048,6 +4048,7 @@ struct TritonGPUVerifyTensorLayoutInterface
                triton::LoadOp, triton::StoreOp, triton::JoinOp, triton::SplitOp,
                triton::DotOp, triton::DotScaledOp, triton::CallOp,
                triton::ReturnOp, triton::FuncOp, triton::AssertOp,
+               triton::MapElementwiseOp,
                triton::gpu::ConvertLayoutOp, triton::gpu::Fp4ToFpOp,
                triton::gpu::LocalLoadOp, triton::gpu::LocalStoreOp>(op);
   }
